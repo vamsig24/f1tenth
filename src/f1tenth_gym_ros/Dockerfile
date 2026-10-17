@@ -43,6 +43,12 @@ RUN git clone https://github.com/f1tenth/f1tenth_gym
 RUN cd f1tenth_gym && \
     pip3 install -e .
 
+# JAX for the opp_aware_mppi_f1tenth MPPI controller. 0.5.3 is the last release
+# supporting Python 3.10; numpy/scipy are pinned back afterwards because the
+# jax wheels pull numpy 2.x, which breaks f110-gym and ml_dtypes 0.6.
+RUN pip3 install --no-cache-dir "jax[cuda12]==0.5.3" "jax-cuda12-plugin[with-cuda]==0.5.3" && \
+    pip3 install --no-cache-dir "numpy==1.26.4" "scipy==1.11.4" "ml_dtypes==0.5.1"
+
 # ros2 gym bridge
 RUN mkdir -p sim_ws/src/f1tenth_gym_ros
 COPY . /sim_ws/src/f1tenth_gym_ros
