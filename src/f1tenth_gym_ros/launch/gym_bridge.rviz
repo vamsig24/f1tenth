@@ -157,6 +157,41 @@ Visualization Manager:
       Update Interval: 0
       Value: true
       Visual Enabled: true
+    # MPPI debug markers. These publishers are BEST_EFFORT, so the displays must
+    # match or RViz silently receives nothing.
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MPPI Reference
+      Namespaces: {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /mppi/reference
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MPPI Optimal Trajectory
+      Namespaces: {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /mppi/optimal_trajectory
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MPPI Sampled Trajectories
+      Namespaces: {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /mppi/sampled_trajectories
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
