@@ -24,7 +24,7 @@ occupancy_grid_(std::make_unique<nav_msgs::msg::OccupancyGrid>()),
 
     // ROS subscribers
     // TODO: create subscribers as you need
-    use_sim_ = true;
+    use_sim_ = false;
 
     string scan_topic = "/scan";
     if (use_sim_) {
@@ -52,7 +52,7 @@ occupancy_grid_(std::make_unique<nav_msgs::msg::OccupancyGrid>()),
     timer_ = this->create_wall_timer(
         std::chrono::milliseconds(50), std::bind(&RRT::timer_callback, this));
 
-    waypoints_ = pure_pursuit::LoadCSV("/sim_ws/src/pure_pursuit/waypoints/waypoints.csv");
+    waypoints_ = pure_pursuit::LoadCSV("/home/f1tenth_ws/src/pure_pursuit/waypoints/aims.csv");
     waypoints_in_execution_ = waypoints_;
 
         std::cout << "Loaded waypoints " << waypoints_.size() << " from CSV" << std::endl;
