@@ -192,6 +192,17 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /mppi/sampled_trajectories
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MPPI Scan Obstacles
+      Namespaces: {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /mppi/scan_obstacles
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
