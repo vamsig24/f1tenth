@@ -9,6 +9,7 @@ Usage: mppi_obstacle_eval.py [map] [secs] [--reset] [--save=path.npy]
   --reset   teleport the car to the raceline start first (via /initialpose)
   --save    dump the (t, x, y, yaw, v) log for plotting
 """
+import os
 import sys
 import time
 
@@ -21,6 +22,8 @@ from PIL import Image
 from scipy.ndimage import distance_transform_edt
 
 CSV = "/sim_ws/install/mppi_bringup/share/mppi_bringup/waypoints/old/lev_testing/lev_blocked.csv"
+if not os.path.exists(CSV):  # mppi_bringup not built, e.g. when scoring a non-MPPI stack
+    CSV = "/sim_ws/src/opp_aware_mppi_f1tenth/mppi_bringup/waypoints/old/lev_testing/lev_blocked.csv"
 w = np.loadtxt(CSV, delimiter=";", skiprows=3)
 P, S, TOTAL = w[:, 1:3], w[:, 0], w[-1, 0]
 

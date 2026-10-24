@@ -29,6 +29,8 @@ services:
       - .:/sim_ws/src/
     environment:
       - DISPLAY=novnc:0.0
+    ports:
+      - "5050:5050"
     networks:
       - x11
     stdin_open: true
