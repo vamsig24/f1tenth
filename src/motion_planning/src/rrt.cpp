@@ -1,6 +1,19 @@
 // This file contains the class definition of tree nodes and RRT
 // Before you start, please read: https://arxiv.org/pdf/1105.1186.pdf
 // Make sure you have read through the header file as well
+//
+// Pipeline, every 50 ms:
+//   1. Rebuild the inflated local grid from the latest scan.
+//   2. Walk the execution path (reference + any spliced detour) out to the
+//      planning horizon: stopping distance at the CURRENT speed plus a
+//      reaction allowance. If a waypoint inside it is blocked, plan.
+//   3. Goal = first free waypoint past every blocked stretch in view. If the
+//      obstacle runs off the grid, take a free point beside the path at the
+//      grid edge instead and keep extending as the car advances.
+//   4. Goal-biased RRT, then shortcut + smooth, splice into the reference and
+//      publish it for pure pursuit.
+//   5. Publish how far ahead the execution path is clear so pure pursuit can
+//      cap its speed to what has actually been checked.
 
 #include "rrt/rrt.h"
 
@@ -8,22 +21,25 @@
 
 // Destructor of the RRT class
 RRT::~RRT() {
-    // Do something in here, free up used memory, print message, etc.
     RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "RRT shutting down");
 }
 
 // Constructor of the RRT class
-RRT::RRT(): rclcpp::Node("rrt_node"), gen((std::random_device())())
-    ,occupancy_grid_pub_(this->create_publisher<nav_msgs::msg::OccupancyGrid>("occupancy_grid", 1)),
-occupancy_grid_(std::make_unique<nav_msgs::msg::OccupancyGrid>()),
-    x_dist_ {0, OCCUPANCY_GRID_ORIGIN_X_WORLD + OCCUPANCY_GRID_X},
-    y_dist_ {OCCUPANCY_GRID_ORIGIN_Y_WORLD, OCCUPANCY_GRID_ORIGIN_Y_WORLD + OCCUPANCY_GRID_Y} {
+RRT::RRT(): rclcpp::Node("rrt_node")
+    ,occupancy_grid_pub_(this->create_publisher<nav_msgs::msg::OccupancyGrid>("occupancy_grid", 1))
+    ,gen((std::random_device())()) {
 
-    // ROS publishers
-    // TODO: create publishers for the the drive topic, and other topics you might need
+    inflation_radius_ = declare_parameter("inflation_radius", 0.3);
+    max_decel_ = declare_parameter("max_decel", 8.0);
+    reaction_time_ = declare_parameter("reaction_time", 0.3);
+    horizon_margin_ = declare_parameter("horizon_margin", 1.0);
+    min_horizon_ = declare_parameter("min_horizon", 1.5);
+    goal_clearance_ = declare_parameter("goal_clearance", 0.6);
+    max_lat_accel_ = declare_parameter("max_lat_accel", 8.0);
+    path_margin_ = declare_parameter("path_margin", 0.1);
+    max_lateral_offset_ = declare_parameter("max_lateral_offset", 1.5);
+    const auto waypoints_file = declare_parameter("waypoints_file", std::string("/sim_ws/src/pure_pursuit/waypoints/waypoints.csv"));
 
-    // ROS subscribers
-    // TODO: create subscribers as you need
     use_sim_ = true;
 
     string scan_topic = "/scan";
@@ -39,28 +55,27 @@ occupancy_grid_(std::make_unique<nav_msgs::msg::OccupancyGrid>()),
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
       scan_topic, 1, std::bind(&RRT::scan_callback, this, std::placeholders::_1));
 
-    // TODO: create a occupancy grid
-    
     InitialiseOccupancyGrid();
+    clearance_.assign(OCCUPANCY_GRID_TOTAL_CELLS, 0.0F);
 
     waypoint_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "rrt_waypoints", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local());
     tree_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("rrt_tree", 1);
     goal_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("rrt_goal", 1);
-    path_nav_pub_ = this->create_publisher<nav_msgs::msg::Path>("rrt_path", 1);
+    // Latched, so a controller that starts late still gets the current detour.
+    path_nav_pub_ = this->create_publisher<nav_msgs::msg::Path>(
+        "rrt_path", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local());
+    free_distance_pub_ = this->create_publisher<std_msgs::msg::Float32>("/rrt/free_distance", 1);
 
     timer_ = this->create_wall_timer(
         std::chrono::milliseconds(50), std::bind(&RRT::timer_callback, this));
 
-    waypoints_ = pure_pursuit::LoadCSV("/sim_ws/src/pure_pursuit/waypoints/waypoints.csv");
+    // Same resampling as pure pursuit so both splice into identical references.
+    waypoints_ = pure_pursuit::ResamplePath(pure_pursuit::LoadCSV(waypoints_file), PATH_RESOLUTION);
     waypoints_in_execution_ = waypoints_;
+    RCLCPP_INFO(this->get_logger(), "Loaded %zu waypoints from %s", waypoints_.size(), waypoints_file.c_str());
 
-        std::cout << "Loaded waypoints " << waypoints_.size() << " from CSV" << std::endl;
-
-        // RCLCPP_INFO(this->get_logger(), "Loaded %zu waypoints", waypoints_.size());
-
-        PublishWaypoints();
-
+    PublishWaypoints();
 
     RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "Created new RRT Object.");
 }
@@ -86,216 +101,352 @@ void RRT::PublishWaypoints()
 }
 
 void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg) {
-    // The scan callback, update your occupancy grid here
-    // Args:
-    //    scan_msg (*LaserScan): pointer to the incoming scan message
-    // Returns:
-    //
-
-    // TODO: update your occupancy grid
-    InitialiseOccupancyGrid();
-
-    for(size_t i =0 ; i< scan_msg->ranges.size(); i++) {
-        const auto range = scan_msg->ranges[i];
-        if (!std::isfinite(range) || range < scan_msg->range_min || range > scan_msg->range_max) {
-            continue;
-        }
-        const auto angle = scan_msg->angle_min + i * scan_msg->angle_increment;
-        auto [x, y] = GetCartesianCoordsFromPolarCoords(range, angle);
-        x += LASER_TO_BASE_LINK_X;
-
-        const auto index = WorldToMap(x, y);
-        if (!index.has_value()) {
-            continue;
-        }
-
-        const auto center_col = static_cast<int>(index.value() % OCCUPANCY_GRID_WIDTH_CELLS);
-        const auto center_row = static_cast<int>(index.value() / OCCUPANCY_GRID_WIDTH_CELLS);
-        const auto col_start = std::max(0, center_col - OCCUPANCY_GRID_BUFFER_CELLS);
-        const auto col_end = std::min(OCCUPANCY_GRID_WIDTH_CELLS - 1, center_col + OCCUPANCY_GRID_BUFFER_CELLS);
-        const auto row_start = std::max(0, center_row - OCCUPANCY_GRID_BUFFER_CELLS);
-        const auto row_end = std::min(OCCUPANCY_GRID_HEIGHT_CELLS - 1, center_row + OCCUPANCY_GRID_BUFFER_CELLS);
-
-        for (int r = row_start; r <= row_end; ++r) {
-            for (int c = col_start; c <= col_end; ++c) {
-                occupancy_grid_->data[r * OCCUPANCY_GRID_WIDTH_CELLS + c] = OCCUPANCY_GRID_OCCUPIED;
-            }
-        }
-
-    }
-
-    occupancy_grid_pub_->publish(*occupancy_grid_);
-
-
+    // The sim publishes scans at ~250 Hz; inflating every one of them is wasted
+    // work, so only cache it here and rebuild the grid at planning rate.
+    latest_scan_ = scan_msg;
 }
 
 void RRT::odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg) {
     // Ground-truth odometry from the simulator
     current_pose_ = odom_msg->pose.pose;
+    current_speed_ = std::abs(odom_msg->twist.twist.linear.x);
+    have_pose_ = true;
 }
 
 void RRT::pose_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr pose_msg) {
-    // Particle-filter inferred pose on the real vehicle
+    // Particle-filter inferred pose on the real vehicle. It carries no twist,
+    // so estimate speed from successive poses (low-passed against PF jitter).
+    const rclcpp::Time stamp(pose_msg->header.stamp);
+    if (last_pose_position_.has_value()) {
+        const double dt = (stamp - last_pose_stamp_).seconds();
+        if (dt > 1e-3 && dt < 0.5) {
+            const double v = pure_pursuit::Distance(pose_msg->pose.position, *last_pose_position_) / dt;
+            current_speed_ = 0.7 * current_speed_ + 0.3 * v;
+        }
+    }
+    last_pose_position_ = pose_msg->pose.position;
+    last_pose_stamp_ = stamp;
     current_pose_ = pose_msg->pose;
+    have_pose_ = true;
 }
 
 void RRT::timer_callback() {
     RunRRT();
 }
 
-void RRT::RunRRT() {
-    // The RRT main loop happens here, using the latest pose and occupancy grid.
-    // tree as std::vector
-    std::vector<RRT_Node> tree;
-    tree.reserve(100);
-
-    RRT_Node root_node;
-    root_node.x = 0.0;
-    root_node.y = 0.0;
-    root_node.cost = 0.0;
-    root_node.parent = -1;
-    root_node.is_root = true;
-    root_node.current_index = 0;
-    tree.push_back(root_node);
-
-    const auto current_pose_waypoint_idx = pure_pursuit::GetIndexClosestToPoint(current_pose_.position, waypoints_in_execution_);
-
-     std::optional<size_t> goal_waypoint_idx_opt = pure_pursuit::GetClosestIndexAtDistance(lookahead_distance_, current_pose_waypoint_idx, waypoints_in_execution_);
-
-     if(!goal_waypoint_idx_opt.has_value()) {
-         // No valid goal waypoint found at the specified lookahead distance.
-         return;
-     }
-     const auto goal_waypoint_idx = goal_waypoint_idx_opt.value();
-
-     double yaw = tf2::getYaw(current_pose_.orientation);
-
-     double goal_x_vehicle_collision_free = 0.0;
-     double goal_y_vehicle_collision_free = 0.0;
-
-    auto to_vehicle_frame = [&](const geometry_msgs::msg::Point &point) {
-        const double dx = point.x - current_pose_.position.x;
-        const double dy = point.y - current_pose_.position.y;
-        return std::make_pair(std::cos(yaw) * dx + std::sin(yaw) * dy,
-                              -std::sin(yaw) * dx + std::cos(yaw) * dy);
-    };
-
-    // Only plan when a reference waypoint between the car and the lookahead
-    // goal lands on an occupied cell; a clear stretch lets pure pursuit follow it.
-    bool corridor_blocked = false;
-    for(size_t i = current_pose_waypoint_idx; i <= goal_waypoint_idx; ++i) {
-        const auto [wx, wy] = to_vehicle_frame(waypoints_in_execution_[i]);
-        if(IsOccupied(wx, wy)) {
-            corridor_blocked = true;
-            break;
-        }
-    }
-
-    if(!corridor_blocked) {
-        return;
-    }
-
-    for(size_t i = goal_waypoint_idx; i < waypoints_in_execution_.size(); ++i) {
-
-        const auto [goal_x_vehicle, goal_y_vehicle] = to_vehicle_frame(waypoints_in_execution_[i]);
-
-        if(!IsOccupied(goal_x_vehicle, goal_y_vehicle)) {
-            goal_x_vehicle_collision_free = goal_x_vehicle;
-            goal_y_vehicle_collision_free = goal_y_vehicle;
-            break;
-        }
-    }
-
-    if(std::abs(goal_x_vehicle_collision_free) < 1e-6 && std::abs(goal_y_vehicle_collision_free) < 1e-6) {
-        // RCLCPP_WARN(this->get_logger(), "No collision-free goal found");
-        return;
-    }
-   
-    RCLCPP_INFO(this->get_logger(), "RRT triggered: corridor blocked, planning to goal (%.2f, %.2f)",
-                goal_x_vehicle_collision_free, goal_y_vehicle_collision_free);
-
-    PublishGoal(goal_x_vehicle_collision_free, goal_y_vehicle_collision_free);
-
-    int iterations = 0;
-    constexpr int MAX_ITERATIONS = 1000;
-    bool goal_reached = false;
-    RRT_Node goal_node;
-
-    // const auto updated_lookahead_distance = std::hypot(goal_x_vehicle_collision_free.x, goal_y_vehicle_collision_free.y);
-
-
-    while (tree.size() < 100 && iterations++ < MAX_ITERATIONS) {
-        const auto rand_point = sample();
-        const auto nearest_index = nearest(tree, rand_point);
-        auto new_node = steer(tree[nearest_index], rand_point);
-
-        if (new_node.x < tree[nearest_index].x) {
-            continue;  
-        }
-
-        if (check_collision(tree[nearest_index], new_node)) {
-            continue;
-        }
-
-        new_node.current_index = static_cast<int>(tree.size());
-
-        // const auto neighbours = near(tree, new_node);
-        // UpdateBestParent(tree, neighbours, new_node);
-        tree.push_back(new_node);
-        // Rewire(tree, neighbours, tree.back());
-
-        if (is_goal(new_node,  goal_x_vehicle_collision_free,  goal_y_vehicle_collision_free)) {
-            goal_reached = true;
-            goal_node = new_node;
-            break;
-        }
-    }
-
-
-    PublishTree(tree);
-
-    if (goal_reached) {
-        const auto path = find_path(tree, goal_node);
-        const auto path_map_points = PathToMapPoints(path);
-        RCLCPP_INFO(this->get_logger(), "RRT found a path with %zu nodes in %d iterations",
-                    path.size(), iterations);
-        PublishPath(path_map_points);
-        UpdateWaypointsInExecution(path_map_points);
-    } else {
-        RCLCPP_WARN(this->get_logger(), "RRT could not find a path after %d iterations (tree size %zu)",
-                    iterations, tree.size());
-    }
+double RRT::PlanningHorizon() const {
+    // Distance to react and then brake to a stop from the current speed. It
+    // grows with speed on its own, so raising pure pursuit's max_speed needs
+    // no retune here.
+    const double v = current_speed_;
+    const double horizon = v * reaction_time_ + v * v / (2.0 * max_decel_) + horizon_margin_;
+    const double grid_reach = OCCUPANCY_GRID_ORIGIN_X_WORLD + OCCUPANCY_GRID_X - 0.5;
+    return std::clamp(horizon, min_horizon_, grid_reach);
 }
 
-Point2D RRT::sample() {
-    // This method returns a sampled point from the free space
-    // You should restrict so that it only samples a small region
-    // of interest around the car's current position
-    // Args:
-    // Returns:
-    //     sampled_point (Point2D): the sampled point in free space
+std::vector<PathSample> RRT::SamplePath(std::size_t start_idx) const {
+    const double yaw = tf2::getYaw(current_pose_.orientation);
+    const double c = std::cos(yaw), s = std::sin(yaw);
+    const auto& path = waypoints_in_execution_;
+    const auto n = path.size();
+    const double max_arc = OCCUPANCY_GRID_X + OCCUPANCY_GRID_Y;
 
-    // Point2D sampled_point;
- 
+    std::vector<PathSample> samples;
+    double arc = 0.0;
+    std::size_t i = start_idx;
+    for (std::size_t step = 0; step < n && arc <= max_arc; ++step) {
+        const double dx = path[i].x - current_pose_.position.x;
+        const double dy = path[i].y - current_pose_.position.y;
+        PathSample p;
+        p.x = c * dx + s * dy;
+        p.y = -s * dx + c * dy;
+        p.s = arc;
+        p.in_grid = InGrid(p.x, p.y);
+        p.occupied = p.in_grid && IsOccupied(p.x, p.y);
+        samples.push_back(p);
+        const auto next = (i + 1) % n;
+        arc += pure_pursuit::Distance(path[i], path[next]);
+        i = next;
+    }
+    return samples;
+}
 
-    return { x_dist_(gen), y_dist_(gen)};
-    // TODO: fill in this method
-    // look up the documentation on how to use std::mt19937 devices with a distribution
-    // the generator and the distribution is created for you (check the header file)
+double RRT::FreeDistance(const std::vector<PathSample>& samples) const {
+    // Arc length to the first blocked waypoint, or to where the path leaves
+    // the grid (the limit of what has been checked). Waypoints within the
+    // inflation radius of the car are skipped: the car is physically there.
+    for (const auto& p : samples) {
+        if (p.s < inflation_radius_) {
+            continue;
+        }
+        if (!p.in_grid || p.occupied) {
+            return p.s;
+        }
+    }
+    return samples.empty() ? 0.0 : samples.back().s;
+}
 
-    // return sampled_point;
+std::optional<Point2D> RRT::LateralFreePoint(const std::vector<PathSample>& samples, std::size_t j,
+                                             double& offset) const {
+    // Nearest free cell beside samples[j], along the path normal, either side.
+    const std::size_t a = j > 0 ? j - 1 : 0;
+    const std::size_t b = std::min(j + 1, samples.size() - 1);
+    double tx = samples[b].x - samples[a].x, ty = samples[b].y - samples[a].y;
+    const double norm = std::hypot(tx, ty);
+    if (norm < 1e-6) {
+        return std::nullopt;
+    }
+    tx /= norm;
+    ty /= norm;
+    for (double off = OCCUPANCY_GRID_RES; off <= max_lateral_offset_; off += OCCUPANCY_GRID_RES) {
+        for (const double sign : {1.0, -1.0}) {
+            const double gx = samples[j].x - sign * off * ty;
+            const double gy = samples[j].y + sign * off * tx;
+            if (gx > 0.3 && InGrid(gx, gy) && !IsOccupied(gx, gy)) {
+                offset = off;
+                return Point2D(gx, gy);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+double RRT::RejoinLength(double offset) const {
+    // Length of a half-cosine lane change of lateral size `offset` whose peak
+    // curvature, pi^2 * offset / (2 L^2), stays within max_lat_accel at the
+    // current speed: L = pi * v * sqrt(offset / (2 a_lat)). Scales with speed,
+    // so the rejoin stays drivable at full speed instead of forcing a brake.
+    const double v = std::max(current_speed_, 1.0);
+    return std::max(goal_clearance_, M_PI * v * std::sqrt(offset / (2.0 * max_lat_accel_)));
+}
+
+std::optional<Point2D> RRT::SelectGoal(const std::vector<PathSample>& samples, std::size_t first_blocked,
+                                       double horizon, std::vector<Point2D>& goal_tail) {
+    goal_tail.clear();
+    auto goal_at = [&](std::size_t j) {
+        const auto& p = samples[j];
+        for (std::size_t k = j + 1; k < samples.size() && samples[k].s < p.s + goal_clearance_; ++k) {
+            if (!samples[k].in_grid || samples[k].occupied) {
+                break;
+            }
+            goal_tail.emplace_back(samples[k].x, samples[k].y);
+        }
+        return Point2D(p.x, p.y);
+    };
+
+    // The goal must be past every blocked stretch in view. Preferably far
+    // enough beyond it that swinging back onto the reference is a gentle lane
+    // change; if that runs off the grid, settle for the farthest free
+    // waypoint past the obstacle that is in view.
+    double s_preferred = horizon;
+    double s_minimum = horizon;
+    std::optional<std::size_t> fallback;
+    std::size_t last_in_grid = first_blocked;
+    for (std::size_t j = first_blocked; j < samples.size(); ++j) {
+        const auto& p = samples[j];
+        if (!p.in_grid) {
+            break;
+        }
+        last_in_grid = j;
+        if (p.occupied) {
+            double offset = max_lateral_offset_;
+            LateralFreePoint(samples, j, offset);
+            s_preferred = std::max(s_preferred, p.s + RejoinLength(offset));
+            s_minimum = std::max(s_minimum, p.s + goal_clearance_);
+            fallback.reset();
+            continue;
+        }
+        if (p.x > 0.3 && p.s >= s_minimum) {
+            fallback = j;
+            if (p.s >= s_preferred) {
+                return goal_at(j);
+            }
+        }
+    }
+    if (fallback.has_value()) {
+        return goal_at(*fallback);
+    }
+
+    // The obstacle itself runs past the edge of what we can see. Aim beside
+    // the path at the grid edge, smallest offset first; the next cycles extend
+    // the detour as more comes into view.
+    double offset = 0.0;
+    return LateralFreePoint(samples, last_in_grid, offset);
+}
+
+void RRT::RunRRT() {
+    if (!have_pose_ || !latest_scan_ || waypoints_in_execution_.size() < 2) {
+        return;
+    }
+    BuildOccupancyGrid();
+
+    const auto current_pose_waypoint_idx = pure_pursuit::GetIndexClosestToPoint(current_pose_.position, waypoints_in_execution_);
+    auto samples = SamplePath(current_pose_waypoint_idx);
+    const double horizon = PlanningHorizon();
+
+    // Trigger: a blocked waypoint within the horizon. Off-grid waypoints are
+    // unknown, not blocked, so a turn leaving the grid does not fire it.
+    std::optional<std::size_t> first_blocked;
+    for (std::size_t j = 0; j < samples.size() && samples[j].s <= horizon; ++j) {
+        if (samples[j].s >= inflation_radius_ && samples[j].occupied) {
+            first_blocked = j;
+            break;
+        }
+    }
+
+    if (first_blocked.has_value()) {
+        std::vector<Point2D> goal_tail;
+        const auto goal = SelectGoal(samples, *first_blocked, horizon, goal_tail);
+        if (!goal.has_value()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "Path blocked and no free goal in view");
+        } else {
+            PublishGoal(goal->GetX(), goal->GetY());
+
+            std::vector<RRT_Node> tree;
+            tree.reserve(MAX_TREE_NODES);
+            // Root the tree on the current execution path slightly ahead of the
+            // car (where it will be once this plan lands), not at the car. The
+            // new path then continues the one being tracked instead of
+            // restarting from wherever tracking error has put the car, which
+            // otherwise leaves a small S-bend that pure pursuit overshoots.
+            const double root_lead = 0.2 + 0.1 * current_speed_;
+            std::size_t root_idx = 0;
+            for (std::size_t j = 0; j < *first_blocked; ++j) {
+                if (samples[j].s >= root_lead) {
+                    root_idx = j;
+                    break;
+                }
+            }
+            if (root_idx > 0 && samples[root_idx].occupied) {
+                root_idx = 0;
+            }
+            std::vector<Point2D> prefix;
+            for (std::size_t j = 0; j < root_idx; ++j) {
+                prefix.emplace_back(samples[j].x, samples[j].y);
+            }
+            const double root_x = root_idx > 0 ? samples[root_idx].x : 0.0;
+            const double root_y = root_idx > 0 ? samples[root_idx].y : 0.0;
+
+            RRT_Node root_node;
+            root_node.x = root_x;
+            root_node.y = root_y;
+            // Heading the car will have at the root: along the path it is
+            // tracking, or its own heading if rooted at the car.
+            root_node.heading = 0.0;
+            if (root_idx > 0 && root_idx + 1 < samples.size()) {
+                root_node.heading = std::atan2(samples[root_idx + 1].y - samples[root_idx].y,
+                                               samples[root_idx + 1].x - samples[root_idx].x);
+            }
+            root_node.cost = 0.0;
+            root_node.parent = -1;
+            root_node.is_root = true;
+            root_node.current_index = 0;
+            tree.push_back(root_node);
+
+            // Sample only the box that can matter: from the car to just past
+            // the goal, with lateral room on both sides.
+            const double y_lo = std::max(OCCUPANCY_GRID_ORIGIN_Y_WORLD, std::min(root_y, goal->GetY()) - 1.5);
+            const double y_hi = std::min(OCCUPANCY_GRID_ORIGIN_Y_WORLD + OCCUPANCY_GRID_Y, std::max(root_y, goal->GetY()) + 1.5);
+            const double x_hi = std::min(OCCUPANCY_GRID_ORIGIN_X_WORLD + OCCUPANCY_GRID_X, goal->GetX() + 1.0);
+            std::uniform_real_distribution<> x_dist(std::max(0.0, root_x), x_hi);
+            std::uniform_real_distribution<> y_dist(y_lo, y_hi);
+
+            int iterations = 0;
+            bool goal_reached = false;
+            RRT_Node goal_node;
+            while (static_cast<int>(tree.size()) < MAX_TREE_NODES && iterations++ < MAX_ITERATIONS) {
+                const auto rand_point = sample(x_dist, y_dist, *goal);
+                const auto nearest_index = nearest(tree, rand_point);
+                auto new_node = steer(tree[nearest_index], rand_point);
+
+                // Mostly forward: a detour that doubles back is never what we want.
+                const auto& parent = tree[nearest_index];
+                // Drivable: the edge may turn only as far as the car can at the
+                // speed it could still have there after braking from the
+                // current speed over the path so far. Steer toward the sample
+                // but clamp the turn, so the tree still grows every iteration.
+                // Near the car that allows a gentle swerve; farther out,
+                // braking makes tighter turns possible, and pure pursuit's
+                // curvature speed does that braking.
+                const double step = line_cost(parent, new_node);
+                const double v_sq = std::max(current_speed_ * current_speed_ - 2.0 * max_decel_ * parent.cost, 0.25);
+                const double kappa_max = std::min(std::tan(MAX_STEER) / WHEELBASE, max_lat_accel_ / v_sq);
+                const double max_turn = kappa_max * step;
+                const double desired = std::atan2(new_node.y - parent.y, new_node.x - parent.x);
+                const double turn = std::clamp(std::remainder(desired - parent.heading, 2.0 * M_PI), -max_turn, max_turn);
+                new_node.heading = parent.heading + turn;
+                new_node.x = parent.x + step * std::cos(new_node.heading);
+                new_node.y = parent.y + step * std::sin(new_node.heading);
+                // Mostly forward: a detour that doubles back is never what we want.
+                if (new_node.x < parent.x - 0.05) {
+                    continue;
+                }
+                if (check_collision(tree[nearest_index], new_node)) {
+                    continue;
+                }
+                new_node.current_index = static_cast<int>(tree.size());
+                tree.push_back(new_node);
+
+                if (is_goal(new_node, goal->GetX(), goal->GetY())) {
+                    goal_reached = true;
+                    goal_node = new_node;
+                    break;
+                }
+            }
+
+            PublishTree(tree);
+
+            if (goal_reached) {
+                const auto path = find_path(tree, goal_node);
+                std::vector<Point2D> raw;
+                for (auto it = path.rbegin(); it != path.rend(); ++it) {
+                    raw.emplace_back(it->x, it->y);
+                }
+                // The first edge sets the departure heading the tree was
+                // constrained to, so shortcutting starts after it.
+                auto detour = prefix;
+                detour.push_back(raw.front());
+                const auto shortcut = Shortcut(std::vector<Point2D>(raw.begin() + 1, raw.end()));
+                detour.insert(detour.end(), shortcut.begin(), shortcut.end());
+                // End on the reference tangent so the detour rejoins without a kink.
+                if (!goal_tail.empty()) {
+                    detour.push_back(goal_tail.back());
+                }
+                detour = SmoothPath(detour);
+                const auto path_map_points = ToMapPoints(detour);
+                RCLCPP_INFO(this->get_logger(),
+                            "RRT detour: blocked at %.2f m (horizon %.2f m, v %.2f), goal (%.2f, %.2f), %d iterations",
+                            samples[*first_blocked].s, horizon, current_speed_, goal->GetX(), goal->GetY(), iterations);
+                UpdateWaypointsInExecution(path_map_points);
+                PublishPath(waypoints_in_execution_);
+                samples = SamplePath(pure_pursuit::GetIndexClosestToPoint(current_pose_.position, waypoints_in_execution_));
+            } else {
+                RCLCPP_WARN(this->get_logger(), "RRT could not find a path after %d iterations (tree size %zu)",
+                            iterations, tree.size());
+            }
+        }
+    }
+
+    std_msgs::msg::Float32 free_distance;
+    free_distance.data = static_cast<float>(FreeDistance(samples));
+    free_distance_pub_->publish(free_distance);
+    occupancy_grid_pub_->publish(*occupancy_grid_);
+}
+
+Point2D RRT::sample(std::uniform_real_distribution<>& x_dist, std::uniform_real_distribution<>& y_dist,
+                    const Point2D& goal) {
+    // Goal bias: without it, landing within GOAL_THRESHOLD of a goal several
+    // metres away by uniform sampling alone is rare.
+    std::uniform_real_distribution<> unit(0.0, 1.0);
+    if (unit(gen) < GOAL_SAMPLE_RATE) {
+        return goal;
+    }
+    return { x_dist(gen), y_dist(gen)};
 }
 
 
 int RRT::nearest(const std::vector<RRT_Node> &tree, const Point2D &sampled_point) {
     // This method returns the nearest node on the tree to the sampled point
-    // Args:
-    //     tree (std::vector<RRT_Node>): the current RRT tree
-    //     sampled_point (Point2D): the sampled point in free space
-    // Returns:
-    //     nearest_node (int): index of nearest node on the tree
-
-
     const auto& min_it = std::min_element(tree.begin(), tree.end(),
     [&](const RRT_Node& node_1, const RRT_Node& node_2) {
         const auto distance_1 = std::hypot(sampled_point.GetX() - node_1.x, sampled_point.GetY() - node_1.y);
@@ -303,27 +454,12 @@ int RRT::nearest(const std::vector<RRT_Node> &tree, const Point2D &sampled_point
 
         return distance_1 < distance_2;
     });
-    
-    return static_cast<int>(std::distance(tree.begin(), min_it));
-    // TODO: fill in this method
 
-    // return nearest_node;
+    return static_cast<int>(std::distance(tree.begin(), min_it));
 }
 
 RRT_Node RRT::steer(RRT_Node &nearest_node, const Point2D &sampled_point) {
-    // The function steer:(x,y)->z returns a point such that z is “closer” 
-    // to y than x is. The point z returned by the function steer will be 
-    // such that z minimizes ||z−y|| while at the same time maintaining 
-    //||z−x|| <= max_expansion_dist, for a prespecified max_expansion_dist > 0
-
-    // basically, expand the tree towards the sample point (within a max dist)
-
-    // Args:
-    //    nearest_node (RRT_Node): nearest node on the tree to the sampled point
-    //    sampled_point (Point2D): the sampled point in free space
-    // Returns:
-    //    new_node (RRT_Node): new node created from steering
-
+    // Expand the tree towards the sample point, at most MAX_EXPANSION_DIST.
     RRT_Node new_node;
 
     const double dx = sampled_point.GetX() - nearest_node.x;
@@ -331,11 +467,9 @@ RRT_Node RRT::steer(RRT_Node &nearest_node, const Point2D &sampled_point) {
     const double dist = std::hypot(dx, dy);
 
     if (dist <= MAX_EXPANSION_DIST) {
-        // sample is already reachable: z = y
         new_node.x = sampled_point.GetX();
         new_node.y = sampled_point.GetY();
     } else {
-        // move exactly MAX_EXPANSION_DIST toward the sample
         const double scale = MAX_EXPANSION_DIST / dist;
         new_node.x = nearest_node.x + scale * dx;
         new_node.y = nearest_node.y + scale * dy;
@@ -345,70 +479,46 @@ RRT_Node RRT::steer(RRT_Node &nearest_node, const Point2D &sampled_point) {
     new_node.is_root = false;
     new_node.current_index = -1;
     new_node.cost = nearest_node.cost + line_cost(nearest_node, new_node);
-    // TODO: fill in this method
 
     return new_node;
 }
 
 bool RRT::check_collision(const RRT_Node &nearest_node, const RRT_Node &new_node) {
-    // This method returns a boolean indicating if the path between the 
-    // nearest node and the new node created from steering is collision free
-    // Args:
-    //    nearest_node (RRT_Node): nearest node on the tree to the sampled point
-    //    new_node (RRT_Node): new node created from steering
-    // Returns:
-    //    collision (bool): true if in collision, false otherwise
+    // true if the straight segment between the two nodes is in collision
+    return !SegmentFree(Point2D(nearest_node.x, nearest_node.y), Point2D(new_node.x, new_node.y));
+}
 
-
-    const auto distance_between_nodes =  std::hypot(new_node.x - nearest_node.x, new_node.y - nearest_node.y);
-    const auto total_number_of_steps = std::max(1, static_cast<int>(distance_between_nodes / INTERPOLATION_RESOLUTION));
-
-    for( size_t step = 0; step <= total_number_of_steps; ++step) {
-        const double t = static_cast<double>(step) / total_number_of_steps;
-        const auto x = nearest_node.x + t * (new_node.x - nearest_node.x);
-        const auto y = nearest_node.y + t * (new_node.y - nearest_node.y);
-
-        if (IsOccupied(x, y)) {
-            return true;
+double RRT::SegmentClearance(const Point2D& a, const Point2D& b) const {
+    // Smallest obstacle clearance along the segment. Points within
+    // inflation_radius of the car are skipped: the car is physically there,
+    // so if it is already inside the margin of something the way out must
+    // still be plannable.
+    const auto length = std::hypot(b.GetX() - a.GetX(), b.GetY() - a.GetY());
+    const auto steps = std::max(1, static_cast<int>(std::ceil(length / INTERPOLATION_RESOLUTION)));
+    double lowest = std::numeric_limits<double>::infinity();
+    for (int step = 0; step <= steps; ++step) {
+        const double t = static_cast<double>(step) / steps;
+        const auto x = a.GetX() + t * (b.GetX() - a.GetX());
+        const auto y = a.GetY() + t * (b.GetY() - a.GetY());
+        if (std::hypot(x, y) < inflation_radius_) {
+            continue;
         }
+        lowest = std::min(lowest, Clearance(x, y));
     }
+    return lowest;
+}
 
-    // based on the interpolation, we also need to check the final new node position
-    if (IsOccupied(new_node.x, new_node.y)) {
-        return true;
-    }
-
-    return false;
+bool RRT::SegmentFree(const Point2D& a, const Point2D& b, double extra_margin) const {
+    return SegmentClearance(a, b) >= inflation_radius_ + extra_margin;
 }
 
 bool RRT::is_goal(const RRT_Node &latest_added_node, double goal_x, double goal_y) {
-    // This method checks if the latest node added to the tree is close
-    // enough (defined by goal_threshold) to the goal so we can terminate
-    // the search and find a path
-    // Args:
-    //   latest_added_node (RRT_Node): latest addition to the tree
-    //   goal_x (double): x coordinate of the current goal
-    //   goal_y (double): y coordinate of the current goal
-    // Returns:
-    //   close_enough (bool): true if node close enough to the goal
-
     const auto distance_to_goal = std::hypot(latest_added_node.x - goal_x, latest_added_node.y - goal_y);
-
     return distance_to_goal < GOAL_THRESHOLD;
-    // TODO: fill in this method
-
 }
 
 std::vector<RRT_Node> RRT::find_path(std::vector<RRT_Node> &tree, const RRT_Node &latest_added_node) {
-    // This method traverses the tree from the node that has been determined
-    // as goal
-    // Args:
-    //   latest_added_node (RRT_Node): latest addition to the tree that has been
-    //      determined to be close enough to the goal
-    // Returns:
-    //   path (std::vector<RRT_Node>): the vector that represents the order of
-    //      of the nodes traversed as the found path
-    
+    // Walks parents from the goal node back to the root (goal -> root order).
     std::vector<RRT_Node> found_path;
     found_path.reserve(tree.size());
     auto node_found = latest_added_node;
@@ -419,25 +529,86 @@ std::vector<RRT_Node> RRT::find_path(std::vector<RRT_Node> &tree, const RRT_Node
     }
 
     found_path.push_back(node_found);
-
-    // TODO: fill in this method
-
     return found_path;
+}
+
+std::vector<Point2D> RRT::Shortcut(const std::vector<Point2D>& path) {
+    // Greedy line-of-sight pruning: from each kept point jump to the farthest
+    // point still visible. Removes the random zig-zag RRT leaves behind.
+    if (path.size() < 3) {
+        return path;
+    }
+    // Only shortcuts that keep path_margin beyond the inflation are taken, so
+    // the result does not graze obstacles where there is room not to; in a
+    // tight gap it keeps the RRT's own edges.
+    std::vector<Point2D> out{path.front()};
+    std::size_t i = 0;
+    while (i + 1 < path.size()) {
+        std::size_t j = path.size() - 1;
+        while (j > i + 1 && !SegmentFree(path[i], path[j], path_margin_)) {
+            --j;
+        }
+        out.push_back(path[j]);
+        i = j;
+    }
+    return out;
+}
+
+std::vector<Point2D> RRT::SmoothPath(const std::vector<Point2D>& path) {
+    // Chaikin corner cutting on the sparse shortcut vertices (endpoints
+    // pinned). Each pass cuts a quarter of every segment, so corners round out
+    // over metres rather than the few centimetres a dense path would give.
+    // Backs off to fewer passes if rounding brings the path closer to an
+    // obstacle than inflation + path_margin (or than the unsmoothed path
+    // already was, in a gap tighter than that).
+    double raw_clearance = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+        raw_clearance = std::min(raw_clearance, SegmentClearance(path[i], path[i + 1]));
+    }
+    const double required = std::min(inflation_radius_ + path_margin_, raw_clearance);
+    for (int passes = 5; passes >= 0; --passes) {
+        auto smooth = path;
+        for (int iter = 0; iter < passes && smooth.size() > 2; ++iter) {
+            std::vector<Point2D> next{smooth.front()};
+            for (std::size_t i = 0; i + 1 < smooth.size(); ++i) {
+                const auto& a = smooth[i];
+                const auto& b = smooth[i + 1];
+                if (i > 0) {
+                    next.emplace_back(0.75 * a.GetX() + 0.25 * b.GetX(), 0.75 * a.GetY() + 0.25 * b.GetY());
+                }
+                if (i + 2 < smooth.size()) {
+                    next.emplace_back(0.25 * a.GetX() + 0.75 * b.GetX(), 0.25 * a.GetY() + 0.75 * b.GetY());
+                }
+            }
+            next.push_back(smooth.back());
+            smooth = std::move(next);
+        }
+        bool free = true;
+        for (std::size_t i = 0; i + 1 < smooth.size() && free; ++i) {
+            free = SegmentClearance(smooth[i], smooth[i + 1]) >= required;
+        }
+        if (free || passes == 0) {
+            std::vector<geometry_msgs::msg::Point> pts;
+            for (const auto& p : smooth) {
+                geometry_msgs::msg::Point q;
+                q.x = p.GetX();
+                q.y = p.GetY();
+                pts.push_back(q);
+            }
+            std::vector<Point2D> out;
+            for (const auto& q : pure_pursuit::ResamplePath(pts, PATH_RESOLUTION)) {
+                out.emplace_back(q.x, q.y);
+            }
+            return out;
+        }
+    }
+    return path;
 }
 
 // RRT* methods
 double RRT::cost(std::vector<RRT_Node> &tree, const RRT_Node &node) {
-    // This method returns the cost associated with a node
-    // Args:
-    //    tree (std::vector<RRT_Node>): the current tree
-    //    node (RRT_Node): the node the cost is calculated for
-    // Returns:
-    //    cost (double): the cost value associated with the node
-
-    double cost = 0;
-    // TODO: fill in this method
-
-    return cost;
+    (void)tree;
+    return node.cost;
 }
 
 void RRT::UpdateBestParent(const std::vector<RRT_Node> &tree, const std::vector<int> &neighbours, RRT_Node &new_node) {
@@ -468,26 +639,10 @@ void RRT::Rewire(std::vector<RRT_Node> &tree, const std::vector<int> &neighbours
 
 
 double RRT::line_cost(const RRT_Node &n1, const RRT_Node &n2) {
-    // This method returns the cost of the straight line path between two nodes
-    // Args:
-    //    n1 (RRT_Node): the RRT_Node at one end of the path
-    //    n2 (RRT_Node): the RRT_Node at the other end of the path
-    // Returns:
-    //    cost (double): the cost value associated with the path
-
     return std::hypot(n1.x - n2.x, n1.y - n2.y);
-    // TODO: fill in this method
 }
 
 std::vector<int> RRT::near(const std::vector<RRT_Node> &tree,   const RRT_Node &node) {
-    // This method returns the set of Nodes in the neighborhood of a 
-    // node.
-    // Args:
-    //   tree (std::vector<RRT_Node>): the current tree
-    //   node (RRT_Node): the node to find the neighborhood for
-    // Returns:
-    //   neighborhood (std::vector<int>): the index of the nodes in the neighborhood
-
     std::vector<int> neighborhood;
     for(size_t i =0; i < tree.size(); ++i){
         const auto distance = std::hypot(tree[i].x - node.x, tree[i].y - node.y);
@@ -495,21 +650,71 @@ std::vector<int> RRT::near(const std::vector<RRT_Node> &tree,   const RRT_Node &
             neighborhood.push_back(i);
         }
     }
-    // TODO:: fill in this method
-
     return neighborhood;
 }
 
 void RRT::InitialiseOccupancyGrid() {
-    occupancy_grid_ = std::make_unique<nav_msgs::msg::OccupancyGrid>();
-    occupancy_grid_->info.resolution = OCCUPANCY_GRID_RES;
-    occupancy_grid_->info.width = OCCUPANCY_GRID_WIDTH_CELLS;
-    occupancy_grid_->info.height = OCCUPANCY_GRID_HEIGHT_CELLS;
-    occupancy_grid_->data.resize(OCCUPANCY_GRID_TOTAL_CELLS, 0);
-    occupancy_grid_->info.origin.position.x = OCCUPANCY_GRID_ORIGIN_X_WORLD;
-    occupancy_grid_->info.origin.position.y = OCCUPANCY_GRID_ORIGIN_Y_WORLD;
-    occupancy_grid_->header.frame_id = "ego_racecar/base_link";
-    // TODO: fill in this method
+    if (!occupancy_grid_) {
+        occupancy_grid_ = std::make_unique<nav_msgs::msg::OccupancyGrid>();
+        occupancy_grid_->info.resolution = OCCUPANCY_GRID_RES;
+        occupancy_grid_->info.width = OCCUPANCY_GRID_WIDTH_CELLS;
+        occupancy_grid_->info.height = OCCUPANCY_GRID_HEIGHT_CELLS;
+        occupancy_grid_->info.origin.position.x = OCCUPANCY_GRID_ORIGIN_X_WORLD;
+        occupancy_grid_->info.origin.position.y = OCCUPANCY_GRID_ORIGIN_Y_WORLD;
+        occupancy_grid_->info.origin.orientation.w = 1.0;
+        occupancy_grid_->header.frame_id = "ego_racecar/base_link";
+    }
+    occupancy_grid_->data.assign(OCCUPANCY_GRID_TOTAL_CELLS, 0);
+}
+
+void RRT::BuildOccupancyGrid() {
+    // Distance from every cell to the nearest scan return (two-pass chamfer),
+    // so planning can ask for more clearance than the bare inflation where
+    // there is room. Cells closer than inflation_radius (car half-width plus
+    // margin) are occupied, so the planner can treat the car as a point.
+    InitialiseOccupancyGrid();
+    constexpr float kFar = 1e3F;
+    clearance_.assign(OCCUPANCY_GRID_TOTAL_CELLS, kFar);
+    const auto& scan = *latest_scan_;
+    for (size_t i = 0; i < scan.ranges.size(); i++) {
+        const auto range = scan.ranges[i];
+        if (!std::isfinite(range) || range < scan.range_min || range > scan.range_max) {
+            continue;
+        }
+        const auto angle = scan.angle_min + i * scan.angle_increment;
+        auto [x, y] = GetCartesianCoordsFromPolarCoords(range, angle);
+        x += LASER_TO_BASE_LINK_X;
+
+        const auto index = WorldToMap(x, y);
+        if (index.has_value()) {
+            clearance_[index.value()] = 0.0F;
+        }
+    }
+
+    const int w = OCCUPANCY_GRID_WIDTH_CELLS, h = OCCUPANCY_GRID_HEIGHT_CELLS;
+    const float d1 = OCCUPANCY_GRID_RES, d2 = static_cast<float>(OCCUPANCY_GRID_RES * M_SQRT2);
+    auto relax = [&](int r, int c, int dr, int dc, float cost) {
+        const int rr = r + dr, cc = c + dc;
+        if (rr >= 0 && rr < h && cc >= 0 && cc < w) {
+            clearance_[r * w + c] = std::min(clearance_[r * w + c], clearance_[rr * w + cc] + cost);
+        }
+    };
+    for (int r = 0; r < h; ++r) {
+        for (int c = 0; c < w; ++c) {
+            relax(r, c, 0, -1, d1); relax(r, c, -1, 0, d1); relax(r, c, -1, -1, d2); relax(r, c, -1, 1, d2);
+        }
+    }
+    for (int r = h - 1; r >= 0; --r) {
+        for (int c = w - 1; c >= 0; --c) {
+            relax(r, c, 0, 1, d1); relax(r, c, 1, 0, d1); relax(r, c, 1, 1, d2); relax(r, c, 1, -1, d2);
+        }
+    }
+    for (int k = 0; k < OCCUPANCY_GRID_TOTAL_CELLS; ++k) {
+        if (clearance_[k] < inflation_radius_) {
+            occupancy_grid_->data[k] = OCCUPANCY_GRID_OCCUPIED;
+        }
+    }
+    occupancy_grid_->header.stamp = now();
 }
 
 std::pair <double,double> RRT::GetCartesianCoordsFromPolarCoords(double r, double theta) {
@@ -520,8 +725,8 @@ std::pair <double,double> RRT::GetCartesianCoordsFromPolarCoords(double r, doubl
 }
 
 std::optional<uint32_t> RRT::WorldToMap(double x, double y) {
-    const int col = static_cast<int>((x - OCCUPANCY_GRID_ORIGIN_X_WORLD) / OCCUPANCY_GRID_RES);
-    const int row = static_cast<int>((y - OCCUPANCY_GRID_ORIGIN_Y_WORLD) / OCCUPANCY_GRID_RES);
+    const int col = static_cast<int>(std::floor((x - OCCUPANCY_GRID_ORIGIN_X_WORLD) / OCCUPANCY_GRID_RES));
+    const int row = static_cast<int>(std::floor((y - OCCUPANCY_GRID_ORIGIN_Y_WORLD) / OCCUPANCY_GRID_RES));
     if (col < 0 || col >= OCCUPANCY_GRID_WIDTH_CELLS ||
         row < 0 || row >= OCCUPANCY_GRID_HEIGHT_CELLS) {
         return std::nullopt;
@@ -540,12 +745,22 @@ std::optional<std::pair<double,double>> RRT::MapToWorld(uint32_t index) {
     return std::make_pair(x, y);
 }
 
-bool RRT::IsOccupied(double x, double y) {
-    const auto index = WorldToMap(x, y);
-    if (!index.has_value()) {
-        return true;
+bool RRT::InGrid(double x, double y) const {
+    return x >= OCCUPANCY_GRID_ORIGIN_X_WORLD && x < OCCUPANCY_GRID_ORIGIN_X_WORLD + OCCUPANCY_GRID_X &&
+           y >= OCCUPANCY_GRID_ORIGIN_Y_WORLD && y < OCCUPANCY_GRID_ORIGIN_Y_WORLD + OCCUPANCY_GRID_Y;
+}
+
+double RRT::Clearance(double x, double y) const {
+    if (!InGrid(x, y)) {
+        return 0.0;
     }
-    return occupancy_grid_->data[index.value()] == OCCUPANCY_GRID_OCCUPIED;
+    const int col = static_cast<int>((x - OCCUPANCY_GRID_ORIGIN_X_WORLD) / OCCUPANCY_GRID_RES);
+    const int row = static_cast<int>((y - OCCUPANCY_GRID_ORIGIN_Y_WORLD) / OCCUPANCY_GRID_RES);
+    return clearance_[row * OCCUPANCY_GRID_WIDTH_CELLS + col];
+}
+
+bool RRT::IsOccupied(double x, double y) const {
+    return Clearance(x, y) < inflation_radius_;
 }
 
 void RRT::PublishTree(const std::vector<RRT_Node>& tree) {
@@ -612,7 +827,8 @@ void RRT::PublishGoal(double goal_x, double goal_y) {
     marker.color.b = 1.0;
     goal_pub_->publish(marker);
 }
-std::vector<geometry_msgs::msg::Point> RRT::PathToMapPoints(const std::vector<RRT_Node>& path) const {
+
+std::vector<geometry_msgs::msg::Point> RRT::ToMapPoints(const std::vector<Point2D>& path) const {
     std::vector<geometry_msgs::msg::Point> points;
     points.reserve(path.size());
 
@@ -620,11 +836,10 @@ std::vector<geometry_msgs::msg::Point> RRT::PathToMapPoints(const std::vector<RR
     const double origin_x = current_pose_.position.x;
     const double origin_y = current_pose_.position.y;
 
-    // find_path returns goal -> root; reverse so points run root -> goal
-    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+    for (const auto& p : path) {
         geometry_msgs::msg::Point point;
-        point.x = origin_x + std::cos(yaw) * it->x - std::sin(yaw) * it->y;
-        point.y = origin_y + std::sin(yaw) * it->x + std::cos(yaw) * it->y;
+        point.x = origin_x + std::cos(yaw) * p.GetX() - std::sin(yaw) * p.GetY();
+        point.y = origin_y + std::sin(yaw) * p.GetX() + std::cos(yaw) * p.GetY();
         points.push_back(point);
     }
 
@@ -632,28 +847,22 @@ std::vector<geometry_msgs::msg::Point> RRT::PathToMapPoints(const std::vector<RR
 }
 
 void RRT::UpdateWaypointsInExecution(const std::vector<geometry_msgs::msg::Point>& rrt_path) {
-    if (rrt_path.empty()) {
-        return;
-    }
-
-    auto start_idx = pure_pursuit::GetIndexClosestToPoint(rrt_path.front(), waypoints_);
-    auto end_idx = pure_pursuit::GetIndexClosestToPoint(rrt_path.back(), waypoints_);
-    if (start_idx > end_idx) {
-        std::swap(start_idx, end_idx);
-    }
-
-    // Rebuild from the untouched original, replacing the spanned segment with the RRT detour.
-    auto reference = waypoints_;
-    const auto splice_begin = reference.begin() + static_cast<std::ptrdiff_t>(start_idx);
-    const auto splice_end = reference.begin() + static_cast<std::ptrdiff_t>(end_idx) + 1;
-    const auto insert_at = reference.erase(splice_begin, splice_end);
-    reference.insert(insert_at, rrt_path.begin(), rrt_path.end());
-
-    waypoints_in_execution_ = std::move(reference);
+    // Rebuild from the untouched original, replacing the spanned segment with
+    // the RRT detour. Resampled so a jump at the splice seam is interpolated
+    // and shows up as blocked if it cuts through an obstacle.
+    // A detour that ends beside the reference fades back onto it over the
+    // same drivable lane-change length used to place goals.
+    const auto end_idx = pure_pursuit::GetIndexClosestToPoint(rrt_path.back(), waypoints_);
+    const double end_offset = pure_pursuit::Distance(rrt_path.back(), waypoints_[end_idx]);
+    const double blend = end_offset > 0.02 ? RejoinLength(end_offset) : 0.0;
+    waypoints_in_execution_ = pure_pursuit::ResamplePath(pure_pursuit::SpliceDetour(waypoints_, rrt_path, blend), PATH_RESOLUTION);
 }
 
 void RRT::PublishPath(const std::vector<geometry_msgs::msg::Point>& path_points) {
-    // nav_msgs/Path in the map frame so the controller can track it as reference waypoints
+    // The whole execution loop (reference with the detour spliced in) in the
+    // map frame, already resampled to PATH_RESOLUTION. Each pose's z is the
+    // pure_pursuit::PathSource tag, so the controller tracks it as-is with no
+    // splicing or resampling of its own.
     nav_msgs::msg::Path path_msg;
     path_msg.header.frame_id = "map";
     path_msg.header.stamp = now();
