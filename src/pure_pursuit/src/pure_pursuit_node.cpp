@@ -39,7 +39,10 @@ public:
     waypoint_pub_(create_publisher<visualization_msgs::msg::MarkerArray>("/waypoints", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local())),
     lookahead_pub_(create_publisher<visualization_msgs::msg::Marker>("/lookahead_point", 10))
     {
-        waypoints_ = pure_pursuit::LoadCSV("/home/f1tenth_ws/src/pure_pursuit/waypoints/aims.csv");
+         const auto waypoints_path = this->declare_parameter<std::string>(
+        "waypoints_path", use_sim_ ? "/sim_ws/src/pure_pursuit/waypoints/aims.csv" : "/home/f1tenth/f1tenth_ws/src/waypoints/aims.csv");
+
+        waypoints_ = pure_pursuit::LoadCSV(waypoints_path);
         waypoints_in_execution_ = waypoints_;
 
         std::string odom_topic = "/odom";
@@ -77,8 +80,8 @@ private:
     static constexpr double MAX_STEER {0.34};
     static constexpr double MIN_SPEED {1.};
     static constexpr double MAX_SPEED {3.5};
-    static constexpr double MIN_LOOKAHEAD_DISTANCE {0.35F};
-    static constexpr double MAX_LOOKAHEAD_DISTANCE {1.3F};
+    static constexpr double MIN_LOOKAHEAD_DISTANCE {0.8F};
+    static constexpr double MAX_LOOKAHEAD_DISTANCE {1.5F};
     static constexpr double PATH_RESOLUTION {0.1};
 
 

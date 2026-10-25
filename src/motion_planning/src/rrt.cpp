@@ -24,7 +24,11 @@ occupancy_grid_(std::make_unique<nav_msgs::msg::OccupancyGrid>()),
 
     // ROS subscribers
     // TODO: create subscribers as you need
-    use_sim_ = false;
+    use_sim_ = this->declare_parameter<bool>("use_sim", false);
+    base_frame_ = this->declare_parameter<std::string>("base_frame", use_sim_ ? "ego_racecar/base_link" : "base_link");
+    pose_timeout_ = this->declare_parameter<double>("pose_timeout", 0.5);
+    const auto waypoints_path = this->declare_parameter<std::string>(
+        "waypoints_path", use_sim_ ? "/sim_ws/src/pure_pursuit/waypoints/aims.csv" : "/home/f1tenth/f1tenth_ws/src/waypoints/aims.csv");
 
     string scan_topic = "/scan";
     if (use_sim_) {
@@ -52,10 +56,14 @@ occupancy_grid_(std::make_unique<nav_msgs::msg::OccupancyGrid>()),
     timer_ = this->create_wall_timer(
         std::chrono::milliseconds(50), std::bind(&RRT::timer_callback, this));
 
-    waypoints_ = pure_pursuit::LoadCSV("/home/f1tenth_ws/src/pure_pursuit/waypoints/aims.csv");
+    waypoints_ = pure_pursuit::LoadCSV(waypoints_path);
     waypoints_in_execution_ = waypoints_;
 
-        std::cout << "Loaded waypoints " << waypoints_.size() << " from CSV" << std::endl;
+        if (waypoints_.size() < 2) {
+            RCLCPP_FATAL(this->get_logger(), "Could not load waypoints from %s", waypoints_path.c_str());
+            throw std::runtime_error("no waypoints loaded from " + waypoints_path);
+        }
+        std::cout << "Loaded waypoints " << waypoints_.size() << " from " << waypoints_path << std::endl;
 
         // RCLCPP_INFO(this->get_logger(), "Loaded %zu waypoints", waypoints_.size());
 
@@ -94,6 +102,7 @@ void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_m
 
     // TODO: update your occupancy grid
     InitialiseOccupancyGrid();
+    occupancy_grid_->header.stamp = scan_msg->header.stamp;
 
     for(size_t i =0 ; i< scan_msg->ranges.size(); i++) {
         const auto range = scan_msg->ranges[i];
@@ -103,6 +112,12 @@ void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_m
         const auto angle = scan_msg->angle_min + i * scan_msg->angle_increment;
         auto [x, y] = GetCartesianCoordsFromPolarCoords(range, angle);
         x += LASER_TO_BASE_LINK_X;
+
+        // the lidar sees parts of the car (cables, mounts); inflated, these cover
+        // the RRT root and no edge can ever leave it
+        if (x > FOOTPRINT_MIN_X && x < FOOTPRINT_MAX_X && std::abs(y) < FOOTPRINT_HALF_WIDTH) {
+            continue;
+        }
 
         const auto index = WorldToMap(x, y);
         if (!index.has_value()) {
@@ -132,11 +147,19 @@ void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_m
 void RRT::odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg) {
     // Ground-truth odometry from the simulator
     current_pose_ = odom_msg->pose.pose;
+    last_pose_time_ = this->now();
+    have_pose_ = true;
 }
 
 void RRT::pose_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr pose_msg) {
-    // Particle-filter inferred pose on the real vehicle
+    // Particle-filter inferred pose on the real vehicle. The PF tracks the laser
+    // (it publishes map->laser), but the grid and tree are rooted at base_link.
     current_pose_ = pose_msg->pose;
+    const double yaw = tf2::getYaw(current_pose_.orientation);
+    current_pose_.position.x -= LASER_TO_BASE_LINK_X * std::cos(yaw);
+    current_pose_.position.y -= LASER_TO_BASE_LINK_X * std::sin(yaw);
+    last_pose_time_ = this->now();
+    have_pose_ = true;
 }
 
 void RRT::timer_callback() {
@@ -145,6 +168,19 @@ void RRT::timer_callback() {
 
 void RRT::RunRRT() {
     // The RRT main loop happens here, using the latest pose and occupancy grid.
+    // The grid is live from the scan, but waypoints are projected with the pose;
+    // a frozen pose puts them in the wrong place and the planner chases ghosts.
+    if (!have_pose_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Waiting for localization pose");
+        return;
+    }
+    const double pose_age = (this->now() - last_pose_time_).seconds();
+    if (pose_age > pose_timeout_) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Localization pose is %.1fs old, not planning (is the particle filter alive?)", pose_age);
+        return;
+    }
+
     // tree as std::vector
     std::vector<RRT_Node> tree;
     tree.reserve(100);
@@ -225,7 +261,7 @@ void RRT::RunRRT() {
 
 
     while (tree.size() < 100 && iterations++ < MAX_ITERATIONS) {
-        const auto rand_point = sample();
+        const auto rand_point = sample(goal_x_vehicle_collision_free, goal_y_vehicle_collision_free);
         const auto nearest_index = nearest(tree, rand_point);
         auto new_node = steer(tree[nearest_index], rand_point);
 
@@ -267,7 +303,7 @@ void RRT::RunRRT() {
     }
 }
 
-Point2D RRT::sample() {
+Point2D RRT::sample(double goal_x, double goal_y) {
     // This method returns a sampled point from the free space
     // You should restrict so that it only samples a small region
     // of interest around the car's current position
@@ -277,6 +313,9 @@ Point2D RRT::sample() {
 
     // Point2D sampled_point;
  
+    if (unit_dist_(gen) < GOAL_SAMPLE_RATE) {
+        return {goal_x, goal_y};
+    }
 
     return { x_dist_(gen), y_dist_(gen)};
     // TODO: fill in this method
@@ -363,7 +402,9 @@ bool RRT::check_collision(const RRT_Node &nearest_node, const RRT_Node &new_node
     const auto distance_between_nodes =  std::hypot(new_node.x - nearest_node.x, new_node.y - nearest_node.y);
     const auto total_number_of_steps = std::max(1, static_cast<int>(distance_between_nodes / INTERPOLATION_RESOLUTION));
 
-    for( size_t step = 0; step <= total_number_of_steps; ++step) {
+    // step 0 is nearest_node itself, which is already in the tree (or is the car's
+    // own position for the root), so only check from the first step outwards
+    for( int step = 1; step <= total_number_of_steps; ++step) {
         const double t = static_cast<double>(step) / total_number_of_steps;
         const auto x = nearest_node.x + t * (new_node.x - nearest_node.x);
         const auto y = nearest_node.y + t * (new_node.y - nearest_node.y);
@@ -508,7 +549,7 @@ void RRT::InitialiseOccupancyGrid() {
     occupancy_grid_->data.resize(OCCUPANCY_GRID_TOTAL_CELLS, 0);
     occupancy_grid_->info.origin.position.x = OCCUPANCY_GRID_ORIGIN_X_WORLD;
     occupancy_grid_->info.origin.position.y = OCCUPANCY_GRID_ORIGIN_Y_WORLD;
-    occupancy_grid_->header.frame_id = "ego_racecar/base_link";
+    occupancy_grid_->header.frame_id = base_frame_;
     // TODO: fill in this method
 }
 

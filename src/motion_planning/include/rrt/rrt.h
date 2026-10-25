@@ -78,8 +78,15 @@ private:
     constexpr static int8_t OCCUPANCY_GRID_OCCUPIED {100};
     constexpr static double GOAL_THRESHOLD {0.1};
     constexpr static double MAX_EXPANSION_DIST {0.3};
+    // fraction of samples drawn at the goal itself; without this, landing within
+    // GOAL_THRESHOLD of the goal with a 100 node tree is mostly luck
+    constexpr static double GOAL_SAMPLE_RATE {0.15};
     // laser is mounted this far forward of base_link (from ego_racecar.xacro)
     constexpr static double LASER_TO_BASE_LINK_X {0.275};
+    // scan returns inside this box (base_link frame) hit the car itself, not obstacles
+    constexpr static double FOOTPRINT_MIN_X {-0.15};
+    constexpr static double FOOTPRINT_MAX_X {0.45};
+    constexpr static double FOOTPRINT_HALF_WIDTH {0.18};
 
     //RRT*
     constexpr static double RRT_STAR_NEIGHBORHOOD_RADIUS {0.8};
@@ -97,11 +104,18 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
 
     bool use_sim_;
+    // frame the occupancy grid and RRT markers are expressed in (base_link on the car)
+    std::string base_frame_;
+    // stop planning if the localization pose is older than this (particle filter died / stalled)
+    double pose_timeout_;
+    rclcpp::Time last_pose_time_;
+    bool have_pose_ {false};
 
     // random generator, use this
     std::mt19937 gen;
     std::uniform_real_distribution<> x_dist_;
     std::uniform_real_distribution<> y_dist_;
+    std::uniform_real_distribution<> unit_dist_ {0.0, 1.0};
 
     geometry_msgs::msg::Pose current_pose_;
     std::unique_ptr<nav_msgs::msg::OccupancyGrid> occupancy_grid_;
@@ -113,7 +127,7 @@ private:
     // callbacks
     // ground-truth odometry from the simulator
     void odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg);
-    // particle-filter inferred pose on the real vehicle
+    // particle-filter inferred pose on the real vehicle (laser frame, shifted to base_link)
     void pose_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr pose_msg);
     // updates occupancy grid
     void scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg);
@@ -121,7 +135,7 @@ private:
     void RunRRT();
 
     // RRT methods
-    Point2D sample();
+    Point2D sample(double goal_x, double goal_y);
     int nearest(const std::vector<RRT_Node> &tree, const Point2D &sampled_point);
     RRT_Node steer(RRT_Node &nearest_node, const Point2D &sampled_point);
     bool check_collision(const RRT_Node &nearest_node, const RRT_Node &new_node);
