@@ -29,8 +29,10 @@ RRT::RRT(): rclcpp::Node("rrt_node")
     ,occupancy_grid_pub_(this->create_publisher<nav_msgs::msg::OccupancyGrid>("occupancy_grid", 1))
     ,gen((std::random_device())()) {
 
+    use_sim_ = declare_parameter("use_sim", false);
     inflation_radius_ = declare_parameter("inflation_radius", 0.3);
-    max_decel_ = declare_parameter("max_decel", 8.0);
+    // braking measured on the car's bags is 3-5 m/s^2 (median ~4.2); 8 is a sim number
+    max_decel_ = declare_parameter("max_decel", use_sim_ ? 8.0 : 4.0);
     reaction_time_ = declare_parameter("reaction_time", 0.3);
     horizon_margin_ = declare_parameter("horizon_margin", 1.0);
     min_horizon_ = declare_parameter("min_horizon", 1.5);
@@ -38,9 +40,11 @@ RRT::RRT(): rclcpp::Node("rrt_node")
     max_lat_accel_ = declare_parameter("max_lat_accel", 8.0);
     path_margin_ = declare_parameter("path_margin", 0.1);
     max_lateral_offset_ = declare_parameter("max_lateral_offset", 1.5);
-    const auto waypoints_file = declare_parameter("waypoints_file", std::string("/sim_ws/src/pure_pursuit/waypoints/waypoints.csv"));
-
-    use_sim_ = true;
+    base_frame_ = declare_parameter("base_frame", std::string(use_sim_ ? "ego_racecar/base_link" : "base_link"));
+    pose_timeout_ = declare_parameter("pose_timeout", 0.5);
+    const auto waypoints_file = declare_parameter("waypoints_file", std::string(use_sim_
+        ? "/sim_ws/src/pure_pursuit/waypoints/aims.csv"
+        : "/home/f1tenth/f1tenth_ws/src/waypoints/aims.csv"));
 
     string scan_topic = "/scan";
     if (use_sim_) {
@@ -73,6 +77,10 @@ RRT::RRT(): rclcpp::Node("rrt_node")
     // Same resampling as pure pursuit so both splice into identical references.
     waypoints_ = pure_pursuit::ResamplePath(pure_pursuit::LoadCSV(waypoints_file), PATH_RESOLUTION);
     waypoints_in_execution_ = waypoints_;
+    if (waypoints_.size() < 2) {
+        RCLCPP_FATAL(this->get_logger(), "Could not load waypoints from %s", waypoints_file.c_str());
+        throw std::runtime_error("no waypoints loaded from " + waypoints_file);
+    }
     RCLCPP_INFO(this->get_logger(), "Loaded %zu waypoints from %s", waypoints_.size(), waypoints_file.c_str());
 
     PublishWaypoints();
@@ -111,23 +119,32 @@ void RRT::odom_callback(const nav_msgs::msg::Odometry::ConstSharedPtr odom_msg) 
     current_pose_ = odom_msg->pose.pose;
     current_speed_ = std::abs(odom_msg->twist.twist.linear.x);
     have_pose_ = true;
+    last_pose_time_ = this->now();
 }
 
 void RRT::pose_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr pose_msg) {
-    // Particle-filter inferred pose on the real vehicle. It carries no twist,
-    // so estimate speed from successive poses (low-passed against PF jitter).
+    // Particle-filter inferred pose on the real vehicle. The PF tracks the laser
+    // (it publishes map->laser), but the grid and tree are rooted at base_link.
+    auto pose = pose_msg->pose;
+    const double yaw = tf2::getYaw(pose.orientation);
+    pose.position.x -= LASER_TO_BASE_LINK_X * std::cos(yaw);
+    pose.position.y -= LASER_TO_BASE_LINK_X * std::sin(yaw);
+
+    // It carries no twist, so estimate speed from successive poses (low-passed
+    // against PF jitter).
     const rclcpp::Time stamp(pose_msg->header.stamp);
     if (last_pose_position_.has_value()) {
         const double dt = (stamp - last_pose_stamp_).seconds();
         if (dt > 1e-3 && dt < 0.5) {
-            const double v = pure_pursuit::Distance(pose_msg->pose.position, *last_pose_position_) / dt;
+            const double v = pure_pursuit::Distance(pose.position, *last_pose_position_) / dt;
             current_speed_ = 0.7 * current_speed_ + 0.3 * v;
         }
     }
-    last_pose_position_ = pose_msg->pose.position;
+    last_pose_position_ = pose.position;
     last_pose_stamp_ = stamp;
-    current_pose_ = pose_msg->pose;
+    current_pose_ = pose;
     have_pose_ = true;
+    last_pose_time_ = this->now();
 }
 
 void RRT::timer_callback() {
@@ -276,6 +293,18 @@ std::optional<Point2D> RRT::SelectGoal(const std::vector<PathSample>& samples, s
 
 void RRT::RunRRT() {
     if (!have_pose_ || !latest_scan_ || waypoints_in_execution_.size() < 2) {
+        return;
+    }
+    // The grid is live from the scan, but waypoints are projected with the pose;
+    // a frozen pose puts them in the wrong place. Report zero free distance so
+    // pure pursuit stops instead of falling back to an unchecked speed.
+    const double pose_age = (this->now() - last_pose_time_).seconds();
+    if (pose_age > pose_timeout_) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Localization pose is %.1fs old, not planning (is the particle filter alive?)", pose_age);
+        std_msgs::msg::Float32 free_distance;
+        free_distance.data = 0.0F;
+        free_distance_pub_->publish(free_distance);
         return;
     }
     BuildOccupancyGrid();
@@ -662,7 +691,7 @@ void RRT::InitialiseOccupancyGrid() {
         occupancy_grid_->info.origin.position.x = OCCUPANCY_GRID_ORIGIN_X_WORLD;
         occupancy_grid_->info.origin.position.y = OCCUPANCY_GRID_ORIGIN_Y_WORLD;
         occupancy_grid_->info.origin.orientation.w = 1.0;
-        occupancy_grid_->header.frame_id = "ego_racecar/base_link";
+        occupancy_grid_->header.frame_id = base_frame_;
     }
     occupancy_grid_->data.assign(OCCUPANCY_GRID_TOTAL_CELLS, 0);
 }
@@ -684,6 +713,12 @@ void RRT::BuildOccupancyGrid() {
         const auto angle = scan.angle_min + i * scan.angle_increment;
         auto [x, y] = GetCartesianCoordsFromPolarCoords(range, angle);
         x += LASER_TO_BASE_LINK_X;
+
+        // the lidar sees parts of the car (cables, mounts); inflated, these block
+        // the path right ahead and collapse the free distance pure pursuit drives to
+        if (x > FOOTPRINT_MIN_X && x < FOOTPRINT_MAX_X && std::abs(y) < FOOTPRINT_HALF_WIDTH) {
+            continue;
+        }
 
         const auto index = WorldToMap(x, y);
         if (index.has_value()) {
@@ -714,7 +749,7 @@ void RRT::BuildOccupancyGrid() {
             occupancy_grid_->data[k] = OCCUPANCY_GRID_OCCUPIED;
         }
     }
-    occupancy_grid_->header.stamp = now();
+    occupancy_grid_->header.stamp = scan.header.stamp;
 }
 
 std::pair <double,double> RRT::GetCartesianCoordsFromPolarCoords(double r, double theta) {

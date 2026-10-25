@@ -48,20 +48,29 @@ public:
     waypoint_pub_(create_publisher<visualization_msgs::msg::MarkerArray>("/waypoints", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local())),
     lookahead_pub_(create_publisher<visualization_msgs::msg::Marker>("/lookahead_point", 10))
     {
-        max_speed_ = declare_parameter("max_speed", 9.5);
+        use_sim_ = declare_parameter("use_sim", false);
+        // 9.5 m/s is a sim number; the car has only been run up to 3.5
+        max_speed_ = declare_parameter("max_speed", use_sim_ ? 9.5 : 3.5);
         min_speed_ = declare_parameter("min_speed", 1.0);
         max_lat_accel_ = declare_parameter("max_lat_accel", 8.0);
-        max_decel_ = declare_parameter("max_decel", 8.0);
+        // braking measured on the car's bags is 3-5 m/s^2 (median ~4.2); 8 is a sim number
+        max_decel_ = declare_parameter("max_decel", use_sim_ ? 8.0 : 4.0);
         lookahead_min_ = declare_parameter("lookahead_min", 0.5);
         lookahead_time_min_ = declare_parameter("lookahead_time_min", 0.2);
         lookahead_time_max_ = declare_parameter("lookahead_time_max", 0.45);
         chord_tolerance_ = declare_parameter("chord_tolerance", 0.08);
         stop_margin_ = declare_parameter("stop_margin", 0.5);
         free_distance_timeout_ = declare_parameter("free_distance_timeout", 0.5);
-        const auto waypoints_file = declare_parameter("waypoints_file", std::string("/sim_ws/src/pure_pursuit/waypoints/waypoints.csv"));
+        const auto waypoints_file = declare_parameter("waypoints_file", std::string(use_sim_
+            ? "/sim_ws/src/pure_pursuit/waypoints/aims.csv"
+            : "/home/f1tenth/f1tenth_ws/src/waypoints/aims.csv"));
 
         waypoints_ = pure_pursuit::ResamplePath(pure_pursuit::LoadCSV(waypoints_file), PATH_RESOLUTION);
         waypoints_in_execution_ = waypoints_;
+        if (waypoints_.size() < 2) {
+            RCLCPP_FATAL(get_logger(), "Could not load waypoints from %s", waypoints_file.c_str());
+            throw std::runtime_error("no waypoints loaded from " + waypoints_file);
+        }
 
         std::string odom_topic = "/odom";
 
@@ -91,7 +100,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr lookahead_pub_;
     std::vector<geometry_msgs::msg::Point> waypoints_;
     std::vector<geometry_msgs::msg::Point> waypoints_in_execution_;
-    bool use_sim_{true};
+    bool use_sim_;
     nav_msgs::msg::Odometry current_odom_;
     double free_distance_{std::numeric_limits<double>::infinity()};
     rclcpp::Time free_distance_stamp_{0, 0, RCL_ROS_TIME};
@@ -103,6 +112,8 @@ private:
     static constexpr double WHEELBASE {0.3302};
     static constexpr double MAX_STEER {0.34};
     static constexpr double PATH_RESOLUTION {0.1};
+    // laser is mounted this far forward of base_link (from ego_racecar.xacro)
+    static constexpr double LASER_TO_BASE_LINK_X {0.275};
 
 
 private:
@@ -279,7 +290,13 @@ private:
 
     void OnPose(const geometry_msgs::msg::PoseStamped::ConstPtr &pose_msg)
     {
-        ExecutePurepursuit(pose_msg->pose);
+        // The PF tracks the laser (it publishes map->laser); pure pursuit and
+        // RRT's free distance are both measured from base_link.
+        auto pose = pose_msg->pose;
+        const double yaw = tf2::getYaw(pose.orientation);
+        pose.position.x -= LASER_TO_BASE_LINK_X * std::cos(yaw);
+        pose.position.y -= LASER_TO_BASE_LINK_X * std::sin(yaw);
+        ExecutePurepursuit(pose);
     }
 
     void OnFreeDistance(const std_msgs::msg::Float32::ConstPtr &msg)
