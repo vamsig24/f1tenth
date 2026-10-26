@@ -44,7 +44,7 @@ RRT::RRT(): rclcpp::Node("rrt_node")
     pose_timeout_ = declare_parameter("pose_timeout", 0.5);
     const auto waypoints_file = declare_parameter("waypoints_file", std::string(use_sim_
         ? "/sim_ws/src/pure_pursuit/waypoints/aims.csv"
-        : "/home/f1tenth/f1tenth_ws/src/waypoints/aims.csv"));
+        : "/home/f1tenth/f1tenth_ws/src/waypoints/aims_closed.csv"));
 
     string scan_topic = "/scan";
     if (use_sim_) {

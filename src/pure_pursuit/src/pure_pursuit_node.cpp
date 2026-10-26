@@ -35,8 +35,9 @@ using namespace std;
 //   it again so the car never outruns what the planner has cleared.
 // Lookahead: as long as the path stays within chord_tolerance of the straight
 //   line to the lookahead point, bounded to [lookahead_time_min, lookahead_time_max]
-//   seconds of travel. Long on straights, short through a detour, and it
-//   rescales on its own when max_speed changes.
+//   seconds of travel and to [lookahead_min, lookahead_max] metres. Long on
+//   straights, short through a detour, and it rescales on its own when
+//   max_speed changes.
 class PurePursuit : public rclcpp::Node
 {
 public:
@@ -49,21 +50,25 @@ public:
     lookahead_pub_(create_publisher<visualization_msgs::msg::Marker>("/lookahead_point", 10))
     {
         use_sim_ = declare_parameter("use_sim", false);
-        // 9.5 m/s is a sim number; the car has only been run up to 3.5
-        max_speed_ = declare_parameter("max_speed", use_sim_ ? 9.5 : 3.5);
+        // 9.5 m/s is a sim number; the car's lookahead below is tuned at 2.5
+        max_speed_ = declare_parameter("max_speed", use_sim_ ? 9.5 : 2.5);
         min_speed_ = declare_parameter("min_speed", 1.0);
         max_lat_accel_ = declare_parameter("max_lat_accel", 8.0);
         // braking measured on the car's bags is 3-5 m/s^2 (median ~4.2); 8 is a sim number
         max_decel_ = declare_parameter("max_decel", use_sim_ ? 8.0 : 4.0);
         lookahead_min_ = declare_parameter("lookahead_min", 0.5);
-        lookahead_time_min_ = declare_parameter("lookahead_time_min", 0.2);
-        lookahead_time_max_ = declare_parameter("lookahead_time_max", 0.45);
+        lookahead_max_ = declare_parameter("lookahead_max", std::numeric_limits<double>::infinity());
+        // The car's steering responds ~170 ms after the command, and pure pursuit
+        // weaves when that is a large share of the lookahead. 0.6-1.0 s held the car
+        // within ~6 cm (max 21 cm) of the raceline at 2.5 m/s; 0.2-0.45 s weaved +-0.5 m.
+        lookahead_time_min_ = declare_parameter("lookahead_time_min", use_sim_ ? 0.2 : 0.6);
+        lookahead_time_max_ = declare_parameter("lookahead_time_max", use_sim_ ? 0.45 : 1.0);
         chord_tolerance_ = declare_parameter("chord_tolerance", 0.08);
         stop_margin_ = declare_parameter("stop_margin", 0.5);
         free_distance_timeout_ = declare_parameter("free_distance_timeout", 0.5);
         const auto waypoints_file = declare_parameter("waypoints_file", std::string(use_sim_
             ? "/sim_ws/src/pure_pursuit/waypoints/aims.csv"
-            : "/home/f1tenth/f1tenth_ws/src/waypoints/aims.csv"));
+            : "/home/f1tenth/f1tenth_ws/src/waypoints/aims_closed.csv"));
 
         waypoints_ = pure_pursuit::ResamplePath(pure_pursuit::LoadCSV(waypoints_file), PATH_RESOLUTION);
         waypoints_in_execution_ = waypoints_;
@@ -106,7 +111,7 @@ private:
     rclcpp::Time free_distance_stamp_{0, 0, RCL_ROS_TIME};
 
     double max_speed_, min_speed_, max_lat_accel_, max_decel_;
-    double lookahead_min_, lookahead_time_min_, lookahead_time_max_, chord_tolerance_;
+    double lookahead_min_, lookahead_max_, lookahead_time_min_, lookahead_time_max_, chord_tolerance_;
     double stop_margin_, free_distance_timeout_;
 
     static constexpr double WHEELBASE {0.3302};
@@ -142,8 +147,8 @@ private:
     std::size_t AdaptiveLookahead(const geometry_msgs::msg::Point& car, std::size_t start_idx, double speed,
                                   const std::vector<geometry_msgs::msg::Point>& waypoints) const
     {
-        const double lo = std::max(lookahead_min_, lookahead_time_min_ * speed);
-        const double hi = std::max(lo, lookahead_time_max_ * speed);
+        const double lo = std::min(std::max(lookahead_min_, lookahead_time_min_ * speed), lookahead_max_);
+        const double hi = std::clamp(lookahead_time_max_ * speed, lo, lookahead_max_);
         const auto n = waypoints.size();
 
         std::vector<std::size_t> idx{start_idx};
