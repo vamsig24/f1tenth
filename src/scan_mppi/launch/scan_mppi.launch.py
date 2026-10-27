@@ -51,8 +51,12 @@ def setup(context):
                                        f'using waypoints_file from {cfg["config"]}.yaml'))
     if overrides:
         params.append(overrides)
+    env = {}
+    if cfg['config'] == 'car' and os.path.isdir('/usr/local/cuda/lib64'):
+        # JetPack's CUDA libraries for GPU JAX (scripts/setup_jetson.sh)
+        env['LD_LIBRARY_PATH'] = ':'.join(p for p in ('/usr/local/cuda/lib64', os.environ.get('LD_LIBRARY_PATH')) if p)
     return actions + [Node(package='scan_mppi', executable='scan_mppi_node', name='scan_mppi',
-                           output='screen', parameters=params)]
+                           output='screen', parameters=params, additional_env=env)]
 
 
 def generate_launch_description():

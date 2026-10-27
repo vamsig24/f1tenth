@@ -1,12 +1,16 @@
 """F1TENTH vehicle constants.
 
-Geometry, steering and motor limits are the f1tenth_gym defaults (f110_env.py),
-which come from the F1TENTH car (Traxxas Slash 4x4 chassis, VESC). The planner
-uses a kinematic bicycle with the steady-state understeer of the gym's
-single-track model, so nothing here needs tuning per deployment except the
+Geometry, tyre and motor parameters are the f1tenth_gym defaults (f110_env.py),
+which come from the F1TENTH car (Traxxas Slash 4x4 chassis, VESC). What differs
+between the gym and our car (steering limit and servo speed, the VESC speed
+loop, latency) is in the two Models at the bottom; the car's were measured
+from its 2026-10-25 bags. Nothing here needs tuning per deployment except the
 friction coefficient, which is a launch parameter.
 """
 import math
+from typing import NamedTuple
+
+import numpy as np
 
 G = 9.81
 
@@ -15,8 +19,6 @@ LR = 0.17145              # CG to rear axle (m)
 WHEELBASE = LF + LR
 LENGTH = 0.58             # body (m)
 WIDTH = 0.31
-MAX_STEER = 0.4189        # rad
-MAX_STEER_RATE = 3.2      # rad/s
 A_MAX = 9.51              # m/s^2, also the braking limit
 V_SWITCH = 7.319          # m/s, above this the motor limits accel to A_MAX * V_SWITCH / v
 
@@ -30,23 +32,7 @@ MASS = 3.74               # kg
 INERTIA = 0.04712         # yaw inertia (kg m^2)
 STEER_DELAY = 0.02        # s: the gym holds steering commands for two 10 ms steps
 
-# Command latency: time from the pose the controller plans from to its command
-# acting on the car. The node measures the pose's age and the solve time and
-# adds these constants for the part it cannot see (transport and the
-# servo/VESC response; one 10 ms step in the gym). The controller predicts the
-# state that far ahead before planning. Guessing too high hurts more than
-# too low, so they are kept small.
-LATENCY_SIM = 0.01
-LATENCY_CAR = 0.03
-
-# Low-level speed loop. In the gym, /drive speed goes through a P controller
-# (f110_gym dynamic_models.pid): accel = kp * (v_cmd - v), kp = 10 * a_max / v_max
-# when speeding up and 10 * a_max / |v_min| when slowing down. On the car the
-# VESC holds speed much more tightly; a stiff first-order loop models it.
-SPEED_KP_SIM = (10.0 * A_MAX / 20.0, 10.0 * A_MAX / 5.0)
-SPEED_KP_CAR = (20.0, 20.0)
-
-# LiDAR mount, ahead of base_link (ego_racecar.xacro; same on the car).
+# LiDAR mount, ahead of base_link (ego_racecar.xacro; 0.27 on the car's tf).
 LASER_X = 0.275
 
 # base_link is the rear axle; the body runs from ~0.10 m behind it to ~0.48 m
@@ -58,3 +44,38 @@ BODY_CENTER_X = 0.19
 N_CIRCLES = 5
 CIRCLE_OFFSETS = tuple(BODY_CENTER_X + (i - (N_CIRCLES - 1) / 2) * LENGTH / N_CIRCLES for i in range(N_CIRCLES))
 CIRCLE_RADIUS = math.hypot(LENGTH / (2 * N_CIRCLES), WIDTH / 2)
+
+
+class Model(NamedTuple):
+    """What the planner needs to know about the low-level control of one vehicle.
+
+    max_steer   steering command limit (rad)
+    steer_rate  steering slew rate (rad/s)
+    kp_up/down  speed loop: accel = kp * (v_cmd - v), speeding up / slowing down (1/s)
+    headroom    how far above max_speed a speed command may go (m/s)
+    latency     time from the pose the controller plans from to its command acting
+                on the car, beyond what the node measures (the pose's age and the
+                solve time). The controller predicts the state that far ahead.
+    """
+    max_steer: float
+    steer_rate: float
+    kp_up: float
+    kp_down: float
+    headroom: float
+    latency: float
+
+    def array(self):
+        return np.array(self[:5], np.float32)
+
+
+# f1tenth_gym: steering bang-bang at sv_max, P speed loop with kp = 10 a_max / v_max
+# up and 10 a_max / |v_min| down (dynamic_models.pid), no integral so commands may
+# exceed max_speed to accelerate; the drive command lands on the next 10 ms step.
+SIM = Model(max_steer=0.4189, steer_rate=3.2, kp_up=10.0 * A_MAX / 20.0, kp_down=10.0 * A_MAX / 5.0,
+            headroom=2.0, latency=0.01)
+
+# Our car, fitted to the 2026-10-25 bags (attem2, attem3): /drive steering is
+# clamped at 0.34 rad (the servo's end stops); the yaw response matches a 2.5 rad/s
+# slew after ~0.14 s of delay plus ~0.03 s of particle-filter lag; the VESC speed loop
+# behaves like kp 2 up / 4 down. The VESC holds the commanded speed, so no headroom.
+CAR = Model(max_steer=0.34, steer_rate=2.5, kp_up=2.0, kp_down=4.0, headroom=0.0, latency=0.15)

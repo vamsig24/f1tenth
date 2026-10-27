@@ -4,6 +4,7 @@ The ROS node and the offline gym harness both drive this class, so what is
 tested offline is exactly what runs on the car.
 """
 import math
+import time
 
 import jax
 import numpy as np
@@ -22,14 +23,35 @@ REVERSE_SPEED = -0.45    # m/s, slow: also keeps the gym in its kinematic (stabl
 REVERSE_TIME = 1.2       # s
 REVERSE_CLEARANCE = 0.12 # m of rear clearance needed to keep reversing
 
+# Solve time budget: warm_up() halves the sample count until a solve fits
+# (the Jetson's GPU is several times slower than a desktop's).
+SOLVE_BUDGET = 0.018     # s, inside a 25 ms (40 Hz) control period
+MIN_SAMPLES = 256
+
+# Odometry speed scale. The VESC converts motor rpm to m/s with a calibrated
+# gain; on our car /odom reads ~1.2x the speed the particle filter sees (bags
+# 2026-10-25), and the same gain turns our speed command into rpm, so the car
+# also drives ~0.84x what it is told. On the car the controller compares
+# distance along the PF pose with distance integrated from /odom and corrects
+# both directions by the ratio.
+SCALE_WINDOW = 4.0       # m of odometry distance per estimate
+SCALE_MIN_SPEED = 1.0    # m/s: only measure while moving properly
+SCALE_LIMITS = (0.7, 1.2)
+
 
 class Controller:
-    def __init__(self, waypoints_file, sim, max_speed, friction, latency=None):
+    def __init__(self, waypoints_file, sim, max_speed, friction, latency=None, model=None):
         self.ref = Reference(waypoints_file, friction, max_speed)
         self.max_speed = float(max_speed)
         self.mu = float(friction)
-        self.kp = np.array(veh.SPEED_KP_SIM if sim else veh.SPEED_KP_CAR, dtype=np.float32)
-        self.latency = (veh.LATENCY_SIM if sim else veh.LATENCY_CAR) if latency is None else float(latency)
+        self.model = model or (veh.SIM if sim else veh.CAR)
+        self.car = self.model.array()
+        self.latency = self.model.latency if latency is None else float(latency)
+        self.n_samples = mp.SAMPLES
+        # odometry speed scale (car only; the gym's odometry is exact)
+        self.calibrate_speed = not sim
+        self.speed_scale = 1.0
+        self._scale_acc = None    # (last xy, pf distance, odom distance)
         self.sent = []            # (time, steer, speed) of recent commands
         self.scan_xy = None       # latest scan returns, map frame
         self.ref_idx = None
@@ -90,16 +112,30 @@ class Controller:
         grid = self.clearance_grid(x, y, yaw)
         self.key, sub = jax.random.split(self.key)
         out = mp.solve(sub, self.u_nom, np.float32(v), np.float32(steer), np.float32(yaw_rate), np.float32(self.last_steer_cmd),
-                       ref_xy, ref_v, np.float32(self.ref.ds), grid, np.float32(self.mu), self.kp, self.max_speed)
+                       ref_xy, ref_v, np.float32(self.ref.ds), grid, np.float32(self.mu), self.car, self.max_speed,
+                       self.n_samples)
         return [np.asarray(o) for o in out]
 
-    def warm_up(self):
-        """Compile the solver before the car is live."""
+    def warm_up(self, log=print):
+        """Compile the solver before the car is live, and pick the largest
+        sample count whose solve fits SOLVE_BUDGET."""
         x, y = self.ref.xy[0]
-        self.ref_idx = 0
-        self._solve(x, y, 0.0, 0.0, 0.0, 0.0)
         mp.propagate(np.float32(0), np.float32(0), np.float32(0), np.zeros((mp.PREDICT_MAX, 2), np.float32), 1,
-                     np.float32(self.mu), self.kp)
+                     np.float32(self.mu), self.car)
+        while True:
+            self.ref_idx = 0
+            self._solve(x, y, 0.0, 0.0, 0.0, 0.0)   # compiles for this sample count
+            times = []
+            for _ in range(10):
+                t0 = time.perf_counter()
+                self._solve(x, y, 0.0, 1.0, 0.0, 0.0)
+                times.append(time.perf_counter() - t0)
+            solve = float(np.median(times))
+            log(f'{self.n_samples} samples: solve {1e3 * solve:.1f} ms on {jax.devices()[0].platform}')
+            if solve <= SOLVE_BUDGET or self.n_samples <= MIN_SAMPLES:
+                break
+            self.n_samples //= 2
+        self.u_nom[:] = 0.0
         self.ref_idx = None
 
     def reset_timing(self):
@@ -123,12 +159,13 @@ class Controller:
                           self._cmd_at(t0 + k * h - self.latency)[1]) for k in range(n)], np.float32)
 
     def _send(self, now, steer, speed):
+        """Record a command (true speed) and return it as sent (odometry units)."""
         self.last_steer_cmd = steer
         self.sent.append((now, steer, speed))
         keep = now - self.latency - veh.STEER_DELAY - 0.5
         while len(self.sent) > 1 and self.sent[1][0] < keep:
             self.sent.pop(0)
-        return steer, speed
+        return steer, speed / self.speed_scale
 
     def predict(self, pose, speed, yaw_rate, now, latency):
         """Pose, speed, steering and yaw rate `latency` s after the pose was
@@ -139,16 +176,37 @@ class Controller:
         cmds = np.zeros((mp.PREDICT_MAX, 2), np.float32)
         cmds[:n] = self._wheel_cmds(now + self.latency - latency, n)
         dx, dy, dyaw, steer, v, r = (float(o) for o in mp.propagate(
-            np.float32(max(speed, 0.0)), np.float32(self.steer_est), np.float32(yaw_rate), cmds, n, np.float32(self.mu), self.kp))
+            np.float32(max(speed, 0.0)), np.float32(self.steer_est), np.float32(yaw_rate), cmds, n, np.float32(self.mu), self.car))
         x, y, yaw = pose
         c, s = math.cos(yaw), math.sin(yaw)
         return (x + c * dx - s * dy, y + s * dx + c * dy, yaw + dyaw), v, steer, r
 
+    def _update_speed_scale(self, pose, speed, dt):
+        xy = np.array(pose[:2])
+        if self._scale_acc is None or speed < SCALE_MIN_SPEED:
+            self._scale_acc = (xy, 0.0, 0.0)
+            return
+        last, d_pf, d_odom = self._scale_acc
+        step = float(np.linalg.norm(xy - last))
+        if step > 2.0 * speed * dt + 0.1:          # the pose filter jumped; start over
+            self._scale_acc = (xy, 0.0, 0.0)
+            return
+        d_pf, d_odom = d_pf + step, d_odom + speed * dt
+        if d_odom >= SCALE_WINDOW:
+            ratio = float(np.clip(d_pf / d_odom, *SCALE_LIMITS))
+            self.speed_scale += 0.5 * (ratio - self.speed_scale)
+            d_pf = d_odom = 0.0
+        self._scale_acc = (xy, d_pf, d_odom)
+
     def step(self, pose, speed, now, age=0.0, yaw_rate=None):
-        """pose (x, y, yaw) in the map frame, speed m/s, now in seconds, age: how
-        long before `now` the pose was measured plus the expected solve time.
-        yaw_rate: measured (rad/s); None assumes the steady state for the
-        steering angle. Returns (steer, speed)."""
+        """pose (x, y, yaw) in the map frame, speed m/s (odometry), now in seconds,
+        age: how long before `now` the pose was measured plus the expected solve
+        time. yaw_rate: measured (rad/s); None assumes the steady state for the
+        steering angle. Returns the (steer, speed) command."""
+        if self.calibrate_speed:
+            if self.last_time is not None:
+                self._update_speed_scale(pose, speed, now - self.last_time)
+            speed *= self.speed_scale               # true speed from here on
         if self.last_time is not None:
             dt = now - self.last_time
             # warm start: advance the previous plan by the elapsed time
@@ -156,7 +214,7 @@ class Controller:
             src = np.arange(mp.STEPS) * mp.DT
             self.u_nom = np.stack([np.interp(t, src, self.u_nom[:, i]) for i in range(2)], 1).astype(np.float32)
             # the steering servo slews at the rate limit toward the command reaching it
-            lim = veh.MAX_STEER_RATE * mp.H_SUB
+            lim = self.model.steer_rate * mp.H_SUB
             n = max(int(round(dt / mp.H_SUB)), 1)
             for cmd in self._wheel_cmds(self.last_time, n)[:, 0]:
                 self.steer_est += float(np.clip(cmd - self.steer_est, -lim, lim))
@@ -183,7 +241,7 @@ class Controller:
                 self.recoveries += 1
                 # reversing with the wheels turned away from the line swings the nose toward it
                 ahead = self.local_reference(x, y, yaw)[0][mp.REF_BACK + 20]
-                self.reverse_steer = -float(np.sign(ahead[1]) or 1.0) * veh.MAX_STEER
+                self.reverse_steer = -float(np.sign(ahead[1]) or 1.0) * self.model.max_steer
                 self.reverse_until = now + REVERSE_TIME
                 return self._send(now, self.reverse_steer, REVERSE_SPEED)
         else:

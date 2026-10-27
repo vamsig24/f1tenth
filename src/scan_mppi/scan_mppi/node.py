@@ -2,8 +2,9 @@
 
 Parameters (the only things to set per deployment):
   waypoints_file  CSV with x, y in the first two columns
-  sim             true: /ego_racecar/odom (pose + speed) and the gym's speed loop
-                  false: /pf/viz/inferred_pose for pose, /odom for speed, VESC speed loop
+  sim             true: /ego_racecar/odom (pose + speed), gym vehicle model
+                  false: /pf/viz/inferred_pose for pose, /odom for speed, our car's
+                  measured model (vehicle.CAR), /odom speed corrected against the PF
   max_speed       m/s
   friction        tyre-floor friction coefficient; sets the grip limit (friction * g)
 
@@ -12,7 +13,12 @@ The pose's age is measured from its header stamp, so only the actuation part
 of the latency is a constant.
 """
 import math
+import os
 import time
+
+# JAX grabs 75% of GPU memory up front by default; on the Jetson that memory is
+# the RAM ROS runs in. Must be set before JAX is imported (by the controller).
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 
 import numpy as np
 import rclpy
@@ -79,8 +85,8 @@ class ScanMPPI(Node):
                     for name in ('reference', 'optimal_trajectory', 'sampled_trajectories', 'scan_obstacles')}
 
         t0 = time.time()
-        self.ctrl.warm_up()
-        self.get_logger().info(f'MPPI compiled in {time.time() - t0:.1f} s')
+        self.ctrl.warm_up(self.get_logger().info)
+        self.get_logger().info(f'MPPI ready in {time.time() - t0:.1f} s, {self.ctrl.n_samples} samples')
         self.create_timer(1.0 / CONTROL_HZ, self.tick)
         self.create_timer(5.0, self.report)
         self.create_timer(1.0 / VIZ_HZ, self.publish_viz)
@@ -184,7 +190,8 @@ class ScanMPPI(Node):
             a = np.array(self.stats) * 1e3
             self.get_logger().info(f'{len(a) / 5.0:.0f} Hz  solve mean {a.mean():.1f} ms  max {a.max():.1f} ms  '
                                    f'latency {1e3 * (self.ctrl.latency + self.last_age):.0f} ms  '
-                                   f'v {self.speed:.2f}  cmd {self.ctrl.u_nom[0, 1]:.2f}')
+                                   f'v {self.speed * self.ctrl.speed_scale:.2f}  cmd {self.ctrl.u_nom[0, 1]:.2f}  '
+                                   f'odom scale {self.ctrl.speed_scale:.2f}  recoveries {self.ctrl.recoveries}')
             self.stats = []
 
 
