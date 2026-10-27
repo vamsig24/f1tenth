@@ -1,0 +1,6 @@
+scan_mppi:
+  ros__parameters:
+    sim: false
+    max_speed: 4.0
+    friction: 0.6         # start low; raise once the car holds the line
+    waypoints_file: /home/f1tenth_ws/src/pure_pursuit/waypoints/aims_closed.csv

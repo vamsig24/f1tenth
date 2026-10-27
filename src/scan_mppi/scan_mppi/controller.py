@@ -1,0 +1,201 @@
+"""ROS-free controller: pose + speed + scan in, (steering, speed) command out.
+
+The ROS node and the offline gym harness both drive this class, so what is
+tested offline is exactly what runs on the car.
+"""
+import math
+
+import jax
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+from . import planner as mp
+from . import vehicle as veh
+from .reference import Reference
+
+# Recovery: when the planner holds the car still with no way forward (a gap it
+# judges too tight, or it ended up nose-in to something), reverse a short way
+# with the wheels turned so the nose swings toward the line, then replan.
+STUCK_SPEED = 0.15       # m/s
+STUCK_TIME = 1.0         # s stopped with a stopped plan before reversing
+REVERSE_SPEED = -0.45    # m/s, slow: also keeps the gym in its kinematic (stable) regime
+REVERSE_TIME = 1.2       # s
+REVERSE_CLEARANCE = 0.12 # m of rear clearance needed to keep reversing
+
+
+class Controller:
+    def __init__(self, waypoints_file, sim, max_speed, friction, latency=None):
+        self.ref = Reference(waypoints_file, friction, max_speed)
+        self.max_speed = float(max_speed)
+        self.mu = float(friction)
+        self.kp = np.array(veh.SPEED_KP_SIM if sim else veh.SPEED_KP_CAR, dtype=np.float32)
+        self.latency = (veh.LATENCY_SIM if sim else veh.LATENCY_CAR) if latency is None else float(latency)
+        self.sent = []            # (time, steer, speed) of recent commands
+        self.scan_xy = None       # latest scan returns, map frame
+        self.ref_idx = None
+        self.steer_est = 0.0      # steering angle, integrated from our own commands
+        self.last_steer_cmd = 0.0
+        self.last_time = None
+        self.u_nom = np.zeros((mp.STEPS, 2), np.float32)
+        self.key = jax.random.PRNGKey(0)
+        self.plan = None          # (T, 3) local x, y, v of the chosen plan
+        self.plan_pose = None     # (x, y, yaw) the plan is relative to (the latency-predicted pose)
+        self.samples = None       # (VIZ_SAMPLES, T, 3) some rollouts, same frame
+        self.plan_cost = 0.0
+        self.stuck_since = None
+        self.reverse_until = None
+        self.reverse_steer = 0.0
+        self.recoveries = 0
+
+    def describe(self):
+        r = self.ref
+        return (f'{r.n} points, {r.length:.1f} m, {"closed" if r.closed else "open"}, '
+                f'speed cap {r.v.min():.1f}..{r.v.max():.1f} m/s')
+
+    def set_scan(self, ranges, angle_min, angle_inc, range_min, range_max, pose):
+        """Store the scan in the map frame, using the pose at scan time."""
+        r = np.asarray(ranges, dtype=np.float32)
+        th = angle_min + angle_inc * np.arange(len(r), dtype=np.float32)
+        ok = np.isfinite(r) & (r > range_min) & (r < min(range_max, 15.0))
+        lx = veh.LASER_X + r[ok] * np.cos(th[ok])
+        ly = r[ok] * np.sin(th[ok])
+        body = (np.abs(lx - veh.BODY_CENTER_X) < veh.LENGTH / 2 + 0.05) & (np.abs(ly) < veh.WIDTH / 2 + 0.05)
+        lx, ly = lx[~body], ly[~body]  # returns off the car itself
+        x, y, yaw = pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        self.scan_xy = np.stack([x + c * lx - s * ly, y + s * lx + c * ly], 1)
+
+    def clearance_grid(self, x, y, yaw):
+        g = np.ones((mp.GRID_NY, mp.GRID_NX), bool)
+        if self.scan_xy is not None and len(self.scan_xy):
+            c, s = math.cos(yaw), math.sin(yaw)
+            dx, dy = self.scan_xy[:, 0] - x, self.scan_xy[:, 1] - y
+            lx, ly = c * dx + s * dy, -s * dx + c * dy
+            ix = ((lx - mp.GRID_X0) / mp.GRID_RES).astype(int)
+            iy = ((ly - mp.GRID_Y0) / mp.GRID_RES).astype(int)
+            ok = (ix >= 0) & (ix < mp.GRID_NX) & (iy >= 0) & (iy < mp.GRID_NY)
+            g[iy[ok], ix[ok]] = False
+        return (distance_transform_edt(g) * mp.GRID_RES).astype(np.float32)
+
+    def local_reference(self, x, y, yaw):
+        self.ref_idx = self.ref.nearest(np.array([x, y]), self.ref_idx)
+        pts, v = self.ref.window(self.ref_idx - mp.REF_BACK, mp.REF_POINTS)
+        c, s = math.cos(yaw), math.sin(yaw)
+        dx, dy = pts[:, 0] - x, pts[:, 1] - y
+        local = np.stack([c * dx + s * dy, -s * dx + c * dy], 1).astype(np.float32)
+        return local, v.astype(np.float32)
+
+    def _solve(self, x, y, yaw, v, steer, yaw_rate):
+        ref_xy, ref_v = self.local_reference(x, y, yaw)
+        grid = self.clearance_grid(x, y, yaw)
+        self.key, sub = jax.random.split(self.key)
+        out = mp.solve(sub, self.u_nom, np.float32(v), np.float32(steer), np.float32(yaw_rate), np.float32(self.last_steer_cmd),
+                       ref_xy, ref_v, np.float32(self.ref.ds), grid, np.float32(self.mu), self.kp, self.max_speed)
+        return [np.asarray(o) for o in out]
+
+    def warm_up(self):
+        """Compile the solver before the car is live."""
+        x, y = self.ref.xy[0]
+        self.ref_idx = 0
+        self._solve(x, y, 0.0, 0.0, 0.0, 0.0)
+        mp.propagate(np.float32(0), np.float32(0), np.float32(0), np.zeros((mp.PREDICT_MAX, 2), np.float32), 1,
+                     np.float32(self.mu), self.kp)
+        self.ref_idx = None
+
+    def reset_timing(self):
+        self.last_time = None
+        self.sent = []
+
+    def _cmd_at(self, t):
+        """Command sent most recently before time t (zero before the first)."""
+        out = (0.0, 0.0)
+        for ts, steer, speed in self.sent:
+            if ts > t:
+                break
+            out = (steer, speed)
+        return out
+
+    def _wheel_cmds(self, t0, n):
+        """(steering, speed) commands acting on the car for n substeps from t0:
+        those sent `latency` earlier (steering a further STEER_DELAY)."""
+        h = mp.H_SUB
+        return np.array([(self._cmd_at(t0 + k * h - self.latency - veh.STEER_DELAY)[0],
+                          self._cmd_at(t0 + k * h - self.latency)[1]) for k in range(n)], np.float32)
+
+    def _send(self, now, steer, speed):
+        self.last_steer_cmd = steer
+        self.sent.append((now, steer, speed))
+        keep = now - self.latency - veh.STEER_DELAY - 0.5
+        while len(self.sent) > 1 and self.sent[1][0] < keep:
+            self.sent.pop(0)
+        return steer, speed
+
+    def predict(self, pose, speed, yaw_rate, now, latency):
+        """Pose, speed, steering and yaw rate `latency` s after the pose was
+        measured, when a command sent now takes effect."""
+        n = min(int(round(latency / mp.H_SUB)), mp.PREDICT_MAX)
+        if n == 0 or not self.sent:
+            return pose, speed, self.steer_est, yaw_rate
+        cmds = np.zeros((mp.PREDICT_MAX, 2), np.float32)
+        cmds[:n] = self._wheel_cmds(now + self.latency - latency, n)
+        dx, dy, dyaw, steer, v, r = (float(o) for o in mp.propagate(
+            np.float32(max(speed, 0.0)), np.float32(self.steer_est), np.float32(yaw_rate), cmds, n, np.float32(self.mu), self.kp))
+        x, y, yaw = pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        return (x + c * dx - s * dy, y + s * dx + c * dy, yaw + dyaw), v, steer, r
+
+    def step(self, pose, speed, now, age=0.0, yaw_rate=None):
+        """pose (x, y, yaw) in the map frame, speed m/s, now in seconds, age: how
+        long before `now` the pose was measured plus the expected solve time.
+        yaw_rate: measured (rad/s); None assumes the steady state for the
+        steering angle. Returns (steer, speed)."""
+        if self.last_time is not None:
+            dt = now - self.last_time
+            # warm start: advance the previous plan by the elapsed time
+            t = np.arange(mp.STEPS) * mp.DT + dt
+            src = np.arange(mp.STEPS) * mp.DT
+            self.u_nom = np.stack([np.interp(t, src, self.u_nom[:, i]) for i in range(2)], 1).astype(np.float32)
+            # the steering servo slews at the rate limit toward the command reaching it
+            lim = veh.MAX_STEER_RATE * mp.H_SUB
+            n = max(int(round(dt / mp.H_SUB)), 1)
+            for cmd in self._wheel_cmds(self.last_time, n)[:, 0]:
+                self.steer_est += float(np.clip(cmd - self.steer_est, -lim, lim))
+        self.last_time = now
+        pose_now = pose
+        if yaw_rate is None:
+            yaw_rate = max(speed, 0.0) * math.tan(self.steer_est) / veh.WHEELBASE
+        pose, speed, steer_wheel, yaw_rate = self.predict(pose, speed, yaw_rate, now, self.latency + age)
+        x, y, yaw = pose
+        if self.reverse_until is not None:
+            if now < self.reverse_until and self.rear_clearance(*pose_now) > REVERSE_CLEARANCE:
+                return self._send(now, self.reverse_steer, REVERSE_SPEED)
+            self.reverse_until = None
+            self.u_nom[:] = 0.0
+        u, traj, cost, samples = self._solve(x, y, yaw, max(speed, 0.0), steer_wheel, yaw_rate)
+        self.u_nom = u
+        self.plan, self.plan_cost = traj, float(cost)
+        self.plan_pose, self.samples = pose, samples
+
+        if abs(speed) < STUCK_SPEED and u[: int(0.5 / mp.DT), 1].max() < STUCK_SPEED:
+            self.stuck_since = now if self.stuck_since is None else self.stuck_since
+            if now - self.stuck_since > STUCK_TIME and self.rear_clearance(*pose_now) > REVERSE_CLEARANCE:
+                self.stuck_since = None
+                self.recoveries += 1
+                # reversing with the wheels turned away from the line swings the nose toward it
+                ahead = self.local_reference(x, y, yaw)[0][mp.REF_BACK + 20]
+                self.reverse_steer = -float(np.sign(ahead[1]) or 1.0) * veh.MAX_STEER
+                self.reverse_until = now + REVERSE_TIME
+                return self._send(now, self.reverse_steer, REVERSE_SPEED)
+        else:
+            self.stuck_since = None
+        return self._send(now, float(u[0, 0]), float(u[0, 1]))
+
+    def rear_clearance(self, x, y, yaw):
+        """Clearance of the rear of the body to scan returns, swept 0.3 m back."""
+        grid = self.clearance_grid(x, y, yaw)
+        best = mp.FAR
+        for back in (0.0, 0.15, 0.3):
+            px = veh.CIRCLE_OFFSETS[0] - back
+            ix = int((px - mp.GRID_X0) / mp.GRID_RES); iy = int((0.0 - mp.GRID_Y0) / mp.GRID_RES)
+            best = min(best, float(grid[iy, ix]) - veh.CIRCLE_RADIUS)
+        return best
