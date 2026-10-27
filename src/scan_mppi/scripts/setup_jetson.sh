@@ -76,12 +76,16 @@ if [[ $MODE == check ]]; then
     ok()   { printf '  \033[32mok\033[0m    %s\n' "$*"; }
     bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fails=$((fails + 1)); }
     note() { printf '  \033[33mnote\033[0m  %s\n' "$*"; }
-    find_lib() { ldconfig -p 2>/dev/null | grep -q "$1" || ls "$CUDA_HOME"/lib64/"$1"* "$CUDA_HOME"/extras/CUPTI/lib64/"$1"* \
-                 /usr/lib/aarch64-linux-gnu/"$1"* >/dev/null 2>&1; }
+    find_lib() {
+        ldconfig -p 2>/dev/null | grep -q "$1" && return 0
+        local d; for d in "$CUDA_HOME"/lib64 "$CUDA_HOME"/extras/CUPTI/lib64 /usr/lib/aarch64-linux-gnu; do
+            compgen -G "$d/$1*" >/dev/null && return 0
+        done; return 1
+    }
 
     say "Platform"
     [[ $(uname -m) == aarch64 ]] && ok "aarch64" || bad "$(uname -m): not the Jetson"
-    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
+    model=$({ tr -d '\0' < /proc/device-tree/model; } 2>/dev/null || true)
     [[ $model == *Orin* ]] && ok "$model" || note "board '${model:-unknown}' (expected an Orin, GPU sm_87)"
     [[ ${L4T%%.*} -ge 36 ]] 2>/dev/null && ok "L4T $L4T (JetPack 6)" || bad "L4T '${L4T:-none}': need JetPack 6 (R36)"
     [[ $PY == 3.10 ]] && ok "python $PY" || bad "python '${PY:-none}': need 3.10"
