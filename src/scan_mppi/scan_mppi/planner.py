@@ -42,6 +42,12 @@ NOISE_LAT_ACCEL = 1.5  # m/s^2: steering noise is sized as lateral acceleration,
 NOISE_STEER_MAX = 0.3   # rad, the cap at low speed: getting round something close needs near full lock
 NOISE_SPEED = 1.5    # m/s
 NOISE_SMOOTH = 0.7   # AR(1) coefficient: correlated noise explores manoeuvres, not jitter
+STEER_NOISE_RAMP = 0.3  # s. Steering noise is sampled on the steering rate and summed from
+                        # the command sent last tick (mlab-upenn/mppi_example samples steering
+                        # rate too): it reaches NOISE_STEER sizes over ~0.3 s, so the first command,
+                        # the one sent, barely moves between ticks. Absolute noise jerked the car
+                        # about. (Speed noise stays absolute: summed, it left the car crawling and
+                        # stalled in tight gaps.)
 SEED_STEERS = 9
 TRACK_SPEED_FRACTIONS = (0.6, 0.75, 0.9, 1.0)
 TRACK_OFFSETS = (-0.45, -0.3, -0.15, 0.0, 0.15, 0.3, 0.45)  # m, sideways copies of the line
@@ -62,7 +68,8 @@ REF_POINTS = 200     # window length (20 m at 0.1 m)
 SEARCH = 12          # points a rollout's projection may advance per step (1.2 m: 24 m/s)
 
 # Cost weights, in units where 1 = one metre of progress lost.
-TEMPERATURE = 0.3    # m: samples more than ~1 m of progress behind the best barely count
+TEMPERATURE = 1.2    # m of progress. At 0.3 a handful of samples set the plan and its speed
+                     # jumped from tick to tick; MODE_SIGMA keeps a wider average on one side.
 MODE_SIGMA = 0.2     # m: samples are also weighted by how near their path stays to the best
                      # sample's (RMS distance). Averaging a go-left and a go-right plan gives
                      # one aimed at the obstacle between them, which then brakes.
@@ -164,7 +171,7 @@ def rollout_costs(U, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, g
             # the steering command reaches the wheels STEER_DELAY late
             cmd = steer_last if j < DELAY_SUBSTEPS else steer_cmd
             sv, a = _inputs(s, cmd, v_cmd, car, mu)
-            s = _rk4(s, sv, a, mu)
+            s = _rk4(s, sv, a, car[8])
             s = s[:3] + (jnp.maximum(s[3], 0.0),) + s[4:]
         x, y, yaw, v, yaw_rate, slip = s[0], s[1], s[4], s[3], s[5], s[6]
         a_total = jnp.hypot((v - v_prev) / DT, v * yaw_rate)
@@ -277,7 +284,7 @@ def _pursuit(offset, frac, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref
         for k in range(SUBSTEPS):
             cmd = steer_last if k < DELAY_SUBSTEPS else steer_cmd
             sv, a = _inputs(s, cmd, v_cmd, car, mu)
-            s = _rk4(s, sv, a, mu)
+            s = _rk4(s, sv, a, car[8])
             s = s[:3] + (jnp.maximum(s[3], 0.0),) + s[4:]
         return (s, steer_cmd, idx), jnp.stack([steer_cmd, v_cmd], -1)
 
@@ -300,33 +307,37 @@ def tracking_seeds(v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, gri
                     v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, mu, car, max_speed)
 
 
-def rate_limit(U, steer_prev, car):
-    """Limit how fast the steering commands in the candidates (K, T, 2) may change,
-    from the command sent last tick, to the servo's own rate: no candidate can flip
-    full left to full right between ticks (the car see-sawed around obstacles).
-    Candidates are limited before they are scored, so the plans stay what the car is
-    told. (The speed command is limited on output, in the controller: the first
-    command of a plan barely changes its cost, so limited here it never rose.)"""
-    d_steer = car[5] * DT
+def rate_limit(U, u_prev, lo, hi, up, down):
+    """Hold candidates (K, T, 2) to the command rate limits, starting from the
+    command sent last tick u_prev (2,): each step may rise at most up (2,) and
+    fall at most down (2,). Candidates are limited before they are scored, so the
+    planner knows how fast the commands it sends can change (and how long a stop
+    takes), and the plan's first command is what the car is sent."""
 
-    def f(prev, s):
-        out = jnp.clip(s, prev - d_steer, prev + d_steer)
+    def f(prev, u):
+        out = jnp.clip(jnp.clip(u, prev - down, prev + up), lo, hi)
         return out, out
 
-    _, steer = jax.lax.scan(f, jnp.full(U.shape[0], steer_prev), U[:, :, 0].T)
-    return U.at[:, :, 0].set(steer.T)
+    _, out = jax.lax.scan(f, jnp.broadcast_to(u_prev, (U.shape[0], 2)), jnp.swapaxes(U, 0, 1))
+    return jnp.swapaxes(out, 0, 1)
 
 
 @partial(jax.jit, static_argnames=('max_speed', 'samples', 'iterations'))
-def solve(key, u_nom, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, grid, mu, car, max_speed,
+def solve(key, u_nom, v0, steer0, yaw_rate0, steer_prev, v_prev, ref_xy, ref_v, ref_ds, grid, mu, car, max_speed,
           samples=SAMPLES, iterations=ITERATIONS):
     """One control tick: `iterations` rounds of MPPI around u_nom (T, 2), `samples` rollouts each.
+    steer_prev, v_prev: the command sent last tick, where every candidate starts from.
     car: vehicle.Model.array() (steering limit and rate, speed-loop gains, command rate limits)."""
     v_plan = jnp.maximum(jnp.maximum(u_nom[:, 1], v0), 1.0)
     sigma_steer = jnp.minimum(NOISE_LAT_ACCEL * veh.WHEELBASE / v_plan ** 2, NOISE_STEER_MAX)
     sigma = jnp.stack([sigma_steer, jnp.full(STEPS, NOISE_SPEED)], -1)  # (T, 2)
     lo = jnp.stack([-car[0], 0.0])
     hi = jnp.stack([car[0], max_speed + car[4]])  # the gym's P loop needs headroom to reach max_speed
+    u_prev = jnp.stack([steer_prev, v_prev])
+    # Candidates change speed at most cmd_accel per second either way; clipped harder
+    # downward than upward, the average of the samples drifted down and the car crawled.
+    step = jnp.stack([car[5], car[6]]) * DT
+    stop_step = jnp.stack([car[5], car[7]]) * DT
 
     # Structured seeds: constant-steer arcs held for 0.5 s then straightened, at a
     # few speeds. Steering and speed noise are independent, so from a slow plan
@@ -348,12 +359,15 @@ def solve(key, u_nom, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, 
 
     for _ in range(iterations):
         key, sub = jax.random.split(key)
-        noise = smooth(jax.random.normal(sub, (samples, STEPS, 2))) * sigma
+        e = smooth(jax.random.normal(sub, (samples, STEPS, 2))) * sigma
+        noise = jnp.stack([jnp.cumsum(e[..., 0], axis=1) * DT / STEER_NOISE_RAMP, e[..., 1]], -1)
         U = jnp.clip(u_nom[None] + noise, lo, hi)
         U = U.at[0].set(u_nom)                                   # keep the warm start
-        U = U.at[1].set(u_nom.at[:, 1].set(0.0))                 # and a hard stop on the same steering
         U = jnp.concatenate([U, seeds])                          # seeds on top of the random samples
-        U = rate_limit(U, steer_prev, car)
+        U = rate_limit(U, u_prev, lo, hi, step, step)
+        # and a hard stop on the same steering, braking as hard as the car is told
+        stop = rate_limit(u_nom.at[:, 1].set(0.0)[None], u_prev, lo, hi, step, stop_step)
+        U = U.at[1].set(stop[0])
         costs, trajs = rollout_costs(U, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, grid, mu, car)
         best = jnp.min(costs)
         w = jnp.exp(-(costs - best) / TEMPERATURE)
@@ -383,7 +397,7 @@ def propagate(v0, steer0, yaw_rate0, cmds, n, mu, car):
     def step(s, x):
         k, u = x
         sv, a = _inputs(s, u[0], u[1], car, mu)
-        nxt = _rk4(s, sv, a, mu)
+        nxt = _rk4(s, sv, a, car[8])
         nxt = nxt[:3] + (jnp.maximum(nxt[3], 0.0),) + nxt[4:]
         return tuple(jnp.where(k < n, b, a_) for b, a_ in zip(nxt, s)), None
 

@@ -9,8 +9,18 @@ Parameters (the only things to set per deployment):
   friction        tyre-floor friction coefficient; sets the grip limit (friction * g)
   samples, iterations   0 (default): picked at startup to fit the solve budget; set them
                   to skip that search (each count tried is one more compile)
-  viz             false: publish no markers (RViz or a bag recording /mppi/* costs the
-                  Jetson's CPU several milliseconds per tick)
+  viz             false: publish no markers (RViz or a bag recording /mppi/* markers costs
+                  the Jetson's CPU several milliseconds per tick)
+
+Prediction check: every tick the plan's start pose (the pose predicted through the
+actuation latency from commands already sent, so a pure test of the vehicle model
+and latency) and the plan itself are published on /mppi/prediction (nav_msgs/Path,
+each pose stamped with the time it predicts). The status line every 5 s compares
+them with the poses that then arrived: position error (median, p90), its along-track
+part (+: the model is ahead of the car, i.e. predicts it faster) and cross-track part
+(+: the model is left of the car), and heading error. The plan horizons (0.5, 1 s)
+also include replanning, so they are larger. scripts/model_check.py does the same
+offline from a bag and fits the model to it.
 
 Everything else (vehicle geometry and dynamics, latency) is in vehicle.py.
 The pose's age is measured from its header stamp, so only the actuation part
@@ -19,6 +29,7 @@ of the latency is a constant.
 import math
 import os
 import time
+from collections import deque
 
 # JAX grabs 75% of GPU memory up front by default; on the Jetson that memory is
 # the RAM ROS runs in. Must be set before JAX is imported (by the controller).
@@ -30,17 +41,19 @@ os.environ.setdefault('JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES', '-1')
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import ColorRGBA
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 
 from . import planner as mp
+from . import vehicle as veh
 from .controller import Controller
 
 CONTROL_HZ = 40.0
@@ -50,6 +63,8 @@ VIZ_HZ = 10.0       # plan and reference
 SLOW_VIZ_HZ = 2.0   # sampled rollouts and scan points: thousands of points, slow to build in Python
 VIZ_ROLLOUTS = 24   # of the planner's VIZ_SAMPLES
 MAX_AGE = 0.12      # s: pose ages beyond this are clock trouble, not latency
+PRED_HORIZONS = (0.5, 1.0)   # s along the plan scored besides its start pose
+PRED_MIN_SPEED = 0.5         # m/s: only score predictions while the car is moving
 
 
 def stamp_of(msg):
@@ -87,6 +102,9 @@ class ScanMPPI(Node):
         self.yaw_rate = None      # measured, from odometry
         self.scan_time = None
         self.stats = []
+        self.pose_hist = deque(maxlen=500)   # (stamp, x, y, yaw): ~10 s at 50 Hz
+        self.preds = deque(maxlen=3000)      # (stamp predicted for, horizon, x, y, yaw)
+        self.pred_errs = []                  # scored (horizon, err, along, cross, dyaw) arrays, for the run summary
 
         sensor = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                             durability=DurabilityPolicy.VOLATILE)
@@ -98,6 +116,7 @@ class ScanMPPI(Node):
             self.create_subscription(Odometry, '/odom', self.on_speed, sensor)
         self.create_subscription(LaserScan, '/scan', self.on_scan, sensor)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 1)
+        self.pred_pub = self.create_publisher(Path, '/mppi/prediction', 10)
         # Same topics and BEST_EFFORT QoS as the displays in f1tenth_gym_ros/launch/gym_bridge.rviz
         self.viz = {name: self.create_publisher(MarkerArray, '/mppi/' + name, sensor)
                     for name in ('reference', 'optimal_trajectory', 'sampled_trajectories', 'scan_obstacles')}
@@ -120,12 +139,14 @@ class ScanMPPI(Node):
         self.pose_stamp = stamp_of(msg)
         self.speed = msg.twist.twist.linear.x
         self.yaw_rate = msg.twist.twist.angular.z
+        self.pose_hist.append((self.pose_stamp,) + self.pose)
 
     def on_pose(self, msg):
         p = msg.pose
         self.pose = (p.position.x, p.position.y, yaw_of(p.orientation))
         self.pose_time = time.time()
         self.pose_stamp = stamp_of(msg)
+        self.pose_hist.append((self.pose_stamp,) + self.pose)
 
     def on_speed(self, msg):
         self.speed = msg.twist.twist.linear.x
@@ -150,13 +171,16 @@ class ScanMPPI(Node):
         # How old the pose is when the command goes out: header age (the pose
         # filter stamps with its scan's time) plus the solve. Ignore a stamp
         # from an unsynchronised clock and fall back to the receive time.
-        age = self.get_clock().now().nanoseconds * 1e-9 - self.pose_stamp
+        ros_now = self.get_clock().now().nanoseconds * 1e-9
+        age = ros_now - self.pose_stamp
         if not 0.0 <= age <= MAX_AGE:
             age = now - self.pose_time
         age = min(age, MAX_AGE) + self.solve_time
         self.last_age = age
         steer, speed = self.ctrl.step(self.pose, self.speed, now, age, self.yaw_rate)
         self.publish(steer, speed)
+        if self.ctrl.planned_at == now:
+            self.log_prediction(ros_now)
         dt = time.time() - now
         self.solve_time += 0.1 * (dt - self.solve_time)
         self.stats.append(dt)
@@ -167,6 +191,87 @@ class ScanMPPI(Node):
         msg.drive.steering_angle = steer
         msg.drive.speed = speed
         self.drive_pub.publish(msg)
+
+    def log_prediction(self, ros_now):
+        """Keep this tick's predictions for scoring and publish them for bags. The
+        plan starts where the car is predicted to be when the command acts:
+        the pose's stamp + its age + solve + actuation latency = now + solve + latency."""
+        ctrl = self.ctrl
+        t0 = ros_now + self.solve_time + ctrl.latency
+        x, y, yaw = ctrl.plan_pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        plan = ctrl.plan[:, :2]
+        pts = np.concatenate([[[0.0, 0.0]], plan])
+        heading = np.arctan2(*np.gradient(pts, axis=0)[:, ::-1].T)
+        moving = np.hypot(*np.diff(pts, axis=0).T) > 1e-3
+        heading[1:][~moving] = 0.0
+        heading[0] = 0.0
+        times = t0 + np.arange(len(pts)) * mp.DT
+        mx = x + c * pts[:, 0] - s * pts[:, 1]
+        my = y + s * pts[:, 0] + c * pts[:, 1]
+        myaw = yaw + heading
+        self.preds.append((t0, 0.0, x, y, yaw))
+        for h in PRED_HORIZONS:
+            k = int(round(h / mp.DT))
+            if k < len(pts):
+                self.preds.append((times[k], h, mx[k], my[k], myaw[k]))
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        for tk, px, py, pyaw in zip(times, mx, my, myaw):
+            ps = PoseStamped()
+            ps.header.frame_id = 'map'
+            ps.header.stamp.sec = int(tk)
+            ps.header.stamp.nanosec = int((tk - int(tk)) * 1e9)
+            ps.pose.position.x, ps.pose.position.y = float(px), float(py)
+            ps.pose.orientation.z, ps.pose.orientation.w = math.sin(pyaw / 2), math.cos(pyaw / 2)
+            msg.poses.append(ps)
+        self.pred_pub.publish(msg)
+
+    def prediction_report(self):
+        """Score the predictions whose time has come against the poses received."""
+        if len(self.pose_hist) < 10 or not self.preds:
+            return ''
+        h = np.array(self.pose_hist)
+        ts, hx, hy, hyaw = h[:, 0], h[:, 1], h[:, 2], np.unwrap(h[:, 3])
+        rows = []
+        while self.preds and self.preds[0][0] <= ts[-1]:
+            rows.append(self.preds.popleft())
+        rows = [r for r in rows if r[0] >= ts[0]]
+        if not rows:
+            return ''
+        r = np.array(rows)
+        t, ax, ay, ayaw = r[:, 0], np.interp(r[:, 0], ts, hx), np.interp(r[:, 0], ts, hy), np.interp(r[:, 0], ts, hyaw)
+        v = np.hypot(np.interp(t + 0.05, ts, hx) - np.interp(t - 0.05, ts, hx),
+                     np.interp(t + 0.05, ts, hy) - np.interp(t - 0.05, ts, hy)) / 0.1
+        dx, dy = r[:, 2] - ax, r[:, 3] - ay
+        along = dx * np.cos(ayaw) + dy * np.sin(ayaw)
+        cross = -dx * np.sin(ayaw) + dy * np.cos(ayaw)
+        dyaw = np.degrees(np.angle(np.exp(1j * (r[:, 4] - ayaw))))
+        e = np.stack([r[:, 1], np.hypot(dx, dy), along, cross, dyaw], 1)[v > PRED_MIN_SPEED]
+        self.pred_errs.append(e)
+        return self.grade_predictions(e, 'pred err')
+
+    def grade_predictions(self, e, title):
+        """One line per call: median/p90 error per horizon, its grade and any systematic offset."""
+        out, statuses = [], []
+        for hz in (0.0,) + PRED_HORIZONS:
+            m = e[:, 0] == hz
+            if m.sum() < 5:
+                continue
+            err, along, cross = 100 * e[m, 1], 100 * e[m, 2].mean(), 100 * e[m, 3].mean()
+            lat = self.ctrl.latency + self.solve_time
+            status, hints = veh.grade(hz if hz > 0.0 else lat, np.median(err), along, cross)
+            statuses.append(status)
+            label = f'{1e3 * lat:.0f} ms' if hz == 0.0 else f'{hz:.1f} s'
+            out.append(f'@{label} {np.median(err):.0f}/{np.percentile(err, 90):.0f} cm {status} '
+                       f'(along {along:+.0f} cross {cross:+.0f}, yaw {np.median(np.abs(e[m, 4])):.1f} deg'
+                       + ''.join(f', {h}' for h in hints) + ')')
+        return f'{title} [{veh.worst(statuses)}] ' + '  '.join(out) if out else ''
+
+    def run_summary(self):
+        e = np.concatenate(self.pred_errs) if self.pred_errs else np.zeros((0, 5))
+        return self.grade_predictions(e, f'whole run ({len(e)} predictions): pred err') or 'no predictions scored (car never moving?)'
 
     def marker(self, ns, kind, width, rgba, points, colors=None, mid=0):
         m = Marker()
@@ -228,6 +333,9 @@ class ScanMPPI(Node):
                                    f'v {self.speed * self.ctrl.speed_scale:.2f}  cmd {self.ctrl.u_nom[0, 1]:.2f}  '
                                    f'odom scale {self.ctrl.speed_scale:.2f}  recoveries {self.ctrl.recoveries}  odom dropouts {self.ctrl.dropouts}')
             self.stats = []
+        pred = self.prediction_report()
+        if pred:
+            self.get_logger().info(pred)
 
 
 def main():
@@ -235,9 +343,11 @@ def main():
     node = ScanMPPI()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.publish(0.0, 0.0)
+        if rclpy.ok():  # under ros2 launch, SIGINT has already shut the context down
+            node.publish(0.0, 0.0)
+        print(node.run_summary(), flush=True)
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()

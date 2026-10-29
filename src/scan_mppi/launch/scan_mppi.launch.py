@@ -1,4 +1,5 @@
 """ros2 launch scan_mppi scan_mppi.launch.py [config:=sim|car] [waypoints_file:=...] [max_speed:=...] [friction:=...]
+                                            [record:=true] [bag_dir:=~/bags]
 
 config picks config/<config>.yaml; the other arguments override it.
 A waypoints_file that is not an absolute path (and not in the current
@@ -6,16 +7,24 @@ directory) is looked up in <workspace>/src/waypoints/ (where the car keeps its
 CSVs), then in scan_mppi's own waypoints/ folder (ri.csv ships there),
 so config:=car works wherever the workspace is.
 
+record:=true also records a bag into bag_dir/mppi_<date-time>: every topic except
+/pf/viz/fake_scan (the particle filter crashes when it has a subscriber) and the
+/mppi markers (building them costs the Jetson milliseconds a tick). It keeps
+/mppi/prediction, which scripts/model_check.py scores against the poses.
+
 With config:=sim and no waypoints_file, the reference follows the gym's map:
 map_path from f1tenth_gym_ros's sim.yaml is looked up in config/tracks.yaml.
 """
 import os
+import time
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction
 from launch_ros.actions import Node
+
+RECORD_EXCLUDE = '/pf/viz/fake_scan|/mppi/(reference|optimal_trajectory|sampled_trajectories|scan_obstacles)'
 
 
 def gym_map():
@@ -77,6 +86,12 @@ def setup(context):
     if cfg['config'] == 'car' and os.path.isdir('/usr/local/cuda/lib64'):
         # JetPack's CUDA libraries for GPU JAX (scripts/setup_jetson.sh)
         env['LD_LIBRARY_PATH'] = ':'.join(p for p in ('/usr/local/cuda/lib64', os.environ.get('LD_LIBRARY_PATH')) if p)
+    if cfg['record'].lower() in ('true', '1', 'yes'):
+        bag_dir = os.path.expanduser(cfg['bag_dir'])
+        os.makedirs(bag_dir, exist_ok=True)
+        out = os.path.join(bag_dir, 'mppi_' + time.strftime('%Y_%m_%d-%H_%M_%S'))
+        actions += [LogInfo(msg=f'scan_mppi: recording {out}'),
+                    ExecuteProcess(cmd=['ros2', 'bag', 'record', '-a', '-x', RECORD_EXCLUDE, '-o', out], output='screen')]
     return actions + [Node(package='scan_mppi', executable='scan_mppi_node', name='scan_mppi',
                            output='screen', parameters=params, additional_env=env)]
 
@@ -87,5 +102,7 @@ def generate_launch_description():
         DeclareLaunchArgument('waypoints_file', default_value=''),
         DeclareLaunchArgument('max_speed', default_value=''),
         DeclareLaunchArgument('friction', default_value=''),
+        DeclareLaunchArgument('record', default_value='false'),
+        DeclareLaunchArgument('bag_dir', default_value='~/bags'),
         OpaqueFunction(function=setup),
     ])

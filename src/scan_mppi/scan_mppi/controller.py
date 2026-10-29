@@ -83,6 +83,7 @@ class Controller:
             self.key = jax.random.PRNGKey(0)
         self.plan = None          # (T, 3) local x, y, v of the chosen plan
         self.plan_pose = None     # (x, y, yaw) the plan is relative to (the latency-predicted pose)
+        self.planned_at = None    # `now` of the step that made the plan (reversing makes none)
         self.samples = None       # (VIZ_SAMPLES, T, 3) some rollouts, same frame
         self.plan_cost = 0.0
         self.stuck_since = None
@@ -134,8 +135,10 @@ class Controller:
         with jax.default_device(self.cpu):
             self.key, sub = jax.random.split(self.key)
         sub = np.asarray(sub)   # uncommitted, so the solve still runs on the default (GPU) device
+        # candidates start from the last speed command sent (after a reverse, from rest)
+        v_prev = max(self.sent[-1][2], 0.0) if self.sent else v
         out = mp.solve(sub, self.u_nom, np.float32(v), np.float32(steer), np.float32(yaw_rate), np.float32(self.last_steer_cmd),
-                       ref_xy, ref_v, np.float32(self.ref.ds), grid, np.float32(self.mu), self.car, self.max_speed,
+                       np.float32(v_prev), ref_xy, ref_v, np.float32(self.ref.ds), grid, np.float32(self.mu), self.car, self.max_speed,
                        self.n_samples, self.iterations)
         return [np.asarray(o) for o in out]
 
@@ -306,6 +309,7 @@ class Controller:
         self.u_nom = np.array(u)   # writable copy (the solver returns read-only arrays)
         self.plan, self.plan_cost = traj, float(cost)
         self.plan_pose, self.samples = pose, samples
+        self.planned_at = now
 
         if abs(speed) < STUCK_SPEED and u[: int(0.5 / mp.DT), 1].max() < STUCK_SPEED:
             self.stuck_since = now if self.stuck_since is None else self.stuck_since
