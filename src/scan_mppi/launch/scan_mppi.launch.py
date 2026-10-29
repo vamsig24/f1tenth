@@ -1,6 +1,10 @@
 """ros2 launch scan_mppi scan_mppi.launch.py [config:=sim|car] [waypoints_file:=...] [max_speed:=...] [friction:=...]
 
 config picks config/<config>.yaml; the other arguments override it.
+A waypoints_file that is not an absolute path (and not in the current
+directory) is looked up in <workspace>/src/waypoints/ (where the car keeps its
+CSVs), then in scan_mppi's own waypoints/ folder (ri.csv ships there),
+so config:=car works wherever the workspace is.
 
 With config:=sim and no waypoints_file, the reference follows the gym's map:
 map_path from f1tenth_gym_ros's sim.yaml is looked up in config/tracks.yaml.
@@ -31,6 +35,17 @@ def track_reference(share, map_name):
     return tracks[match] if match else None
 
 
+def find_waypoints(name, share):
+    """A relative waypoints_file: the current directory, then <ws>/src/waypoints,
+    then scan_mppi's waypoints/. share is <ws>/install/scan_mppi/share/scan_mppi."""
+    ws = os.path.abspath(os.path.join(share, '..', '..', '..', '..'))
+    for path in (os.path.abspath(name), os.path.join(ws, 'src', 'waypoints', name), os.path.join(share, 'waypoints', name)):
+        if os.path.exists(path):
+            return path
+    raise RuntimeError(f'scan_mppi: waypoints_file {name} not found in the current directory, '
+                       f'{os.path.join(ws, "src", "waypoints")} or {os.path.join(share, "waypoints")}')
+
+
 def setup(context):
     cfg = context.launch_configurations
     share = get_package_share_directory('scan_mppi')
@@ -49,6 +64,13 @@ def setup(context):
         else:
             actions.append(LogInfo(msg=f'scan_mppi: no tracks.yaml entry for gym map {map_name}; '
                                        f'using waypoints_file from {cfg["config"]}.yaml'))
+    if cfg['config'] != 'sim' or 'waypoints_file' in overrides:
+        with open(params[0]) as f:
+            path = overrides.get('waypoints_file') or yaml.safe_load(f)['scan_mppi']['ros__parameters']['waypoints_file']
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            path = find_waypoints(path, share)
+        overrides['waypoints_file'] = path
     if overrides:
         params.append(overrides)
     env = {}

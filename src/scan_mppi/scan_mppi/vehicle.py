@@ -53,6 +53,8 @@ class Model(NamedTuple):
     steer_rate  steering slew rate (rad/s)
     kp_up/down  speed loop: accel = kp * (v_cmd - v), speeding up / slowing down (1/s)
     headroom    how far above max_speed a speed command may go (m/s)
+    cmd_steer_rate  fastest the planner's steering command may change (rad/s)
+    cmd_accel, cmd_decel  fastest its speed command may rise / fall (m/s per s)
     latency     time from the pose the controller plans from to its command acting
                 on the car, beyond what the node measures (the pose's age and the
                 solve time). The controller predicts the state that far ahead.
@@ -62,20 +64,29 @@ class Model(NamedTuple):
     kp_up: float
     kp_down: float
     headroom: float
+    cmd_steer_rate: float
+    cmd_accel: float
+    cmd_decel: float
     latency: float
 
     def array(self):
-        return np.array(self[:5], np.float32)
+        return np.array(self[:8], np.float32)
 
 
 # f1tenth_gym: steering bang-bang at sv_max, P speed loop with kp = 10 a_max / v_max
 # up and 10 a_max / |v_min| down (dynamic_models.pid), no integral so commands may
 # exceed max_speed to accelerate; the drive command lands on the next 10 ms step.
 SIM = Model(max_steer=0.4189, steer_rate=3.2, kp_up=10.0 * A_MAX / 20.0, kp_down=10.0 * A_MAX / 5.0,
-            headroom=2.0, latency=0.01)
+            headroom=2.0, cmd_steer_rate=100.0, cmd_accel=1000.0, cmd_decel=1000.0, latency=0.01)
 
 # Our car, fitted to the 2026-10-25 bags (attem2, attem3): /drive steering is
 # clamped at 0.34 rad (the servo's end stops); the yaw response matches a 2.5 rad/s
 # slew after ~0.14 s of delay plus ~0.03 s of particle-filter lag; the VESC speed loop
 # behaves like kp 2 up / 4 down. The VESC holds the commanded speed, so no headroom.
-CAR = Model(max_steer=0.34, steer_rate=2.5, kp_up=2.0, kp_down=4.0, headroom=0.0, latency=0.15)
+# Steering commands change at most at the servo's rated 3.2 rad/s less a margin; the
+# speed sent rises at most cmd_accel and falls at most cmd_decel per second. These are
+# smoothing limits on the commands, not the car's acceleration (the kp gains model
+# that); decel stays high because the planner does not model it, so a lower one
+# would quietly lengthen emergency stops (7 m/s^2: +0.4 m from 3 m/s).
+CAR = Model(max_steer=0.34, steer_rate=2.5, kp_up=2.0, kp_down=4.0, headroom=0.0,
+            cmd_steer_rate=2.8, cmd_accel=7.0, cmd_decel=20.0, latency=0.15)

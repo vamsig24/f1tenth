@@ -26,6 +26,7 @@ REVERSE_CLEARANCE = 0.12 # m of rear clearance needed to keep reversing
 # Solve time budget: warm_up() halves the sample count until a solve fits
 # (the Jetson's GPU is several times slower than a desktop's).
 SOLVE_BUDGET = 0.018     # s, inside a 25 ms (40 Hz) control period
+HALVING_GAIN = 0.85      # halve only while it cuts the solve time by at least 15%
 MIN_SAMPLES = 256
 
 # Odometry speed scale. The VESC converts motor rpm to m/s with a calibrated
@@ -37,6 +38,18 @@ MIN_SAMPLES = 256
 SCALE_WINDOW = 4.0       # m of odometry distance per estimate
 SCALE_MIN_SPEED = 1.0    # m/s: only measure while moving properly
 SCALE_LIMITS = (0.7, 1.2)
+SCALE_JUMP = 0.3         # m beyond the expected step: a pose filter jump, not motion. Poses
+                         # reach the node in bursts, so a tick can see two at once.
+
+# Odometry dropouts. The car's /odom speed falls to ~0 for 20-300 ms a few times
+# every 10 s while the car rolls on (2026-10-28 bag: PF and IMU show no slowdown;
+# also in the pure-pursuit bags). Planning from that "stopped" state made MPPI
+# command a surge, then brake once the reading came back. A reading below what
+# the car can brake to is held off for up to ODOM_HOLD, and the estimate follows
+# the speed loop model meanwhile.
+ODOM_BRAKE = 12.0        # m/s^2, harder than the car brakes (kp_down 4 from 3 m/s)
+ODOM_NOISE = 0.3         # m/s
+ODOM_HOLD = 0.3          # s
 
 
 class Controller:
@@ -48,10 +61,14 @@ class Controller:
         self.car = self.model.array()
         self.latency = self.model.latency if latency is None else float(latency)
         self.n_samples = mp.SAMPLES
+        self.iterations = mp.ITERATIONS
         # odometry speed scale (car only; the gym's odometry is exact)
         self.calibrate_speed = not sim
         self.speed_scale = 1.0
         self._scale_acc = None    # (last xy, pf distance, odom distance)
+        self.v_est = None         # odometry speed with dropouts removed (odometry units)
+        self.dropout_since = None
+        self.dropouts = 0
         self.sent = []            # (time, steer, speed) of recent commands
         self.scan_xy = None       # latest scan returns, map frame
         self.ref_idx = None
@@ -59,7 +76,11 @@ class Controller:
         self.last_steer_cmd = 0.0
         self.last_time = None
         self.u_nom = np.zeros((mp.STEPS, 2), np.float32)
-        self.key = jax.random.PRNGKey(0)
+        # The small per-tick calls (latency prediction, key split) run on the CPU:
+        # on a GPU each is a chain of tiny kernels that costs milliseconds on a Jetson.
+        self.cpu = jax.devices('cpu')[0]
+        with jax.default_device(self.cpu):
+            self.key = jax.random.PRNGKey(0)
         self.plan = None          # (T, 3) local x, y, v of the chosen plan
         self.plan_pose = None     # (x, y, yaw) the plan is relative to (the latency-predicted pose)
         self.samples = None       # (VIZ_SAMPLES, T, 3) some rollouts, same frame
@@ -110,19 +131,24 @@ class Controller:
     def _solve(self, x, y, yaw, v, steer, yaw_rate):
         ref_xy, ref_v = self.local_reference(x, y, yaw)
         grid = self.clearance_grid(x, y, yaw)
-        self.key, sub = jax.random.split(self.key)
+        with jax.default_device(self.cpu):
+            self.key, sub = jax.random.split(self.key)
+        sub = np.asarray(sub)   # uncommitted, so the solve still runs on the default (GPU) device
         out = mp.solve(sub, self.u_nom, np.float32(v), np.float32(steer), np.float32(yaw_rate), np.float32(self.last_steer_cmd),
                        ref_xy, ref_v, np.float32(self.ref.ds), grid, np.float32(self.mu), self.car, self.max_speed,
-                       self.n_samples)
+                       self.n_samples, self.iterations)
         return [np.asarray(o) for o in out]
 
-    def warm_up(self, log=print):
+    def warm_up(self, log=print, search=True):
         """Compile the solver before the car is live, and pick the largest
-        sample count whose solve fits SOLVE_BUDGET."""
+        sample count whose solve fits SOLVE_BUDGET. On a GPU the solve is mostly
+        a fixed chain of small sequential steps (a Jetson takes ~24 ms at any
+        count), so stop halving once it no longer buys a real saving."""
         x, y = self.ref.xy[0]
-        mp.propagate(np.float32(0), np.float32(0), np.float32(0), np.zeros((mp.PREDICT_MAX, 2), np.float32), 1,
-                     np.float32(self.mu), self.car)
-        while True:
+        with jax.default_device(self.cpu):
+            mp.propagate(np.float32(0), np.float32(0), np.float32(0), np.zeros((mp.PREDICT_MAX, 2), np.float32), 1,
+                         np.float32(self.mu), self.car)
+        def timed():
             self.ref_idx = 0
             self._solve(x, y, 0.0, 0.0, 0.0, 0.0)   # compiles for this sample count
             times = []
@@ -131,10 +157,32 @@ class Controller:
                 self._solve(x, y, 0.0, 1.0, 0.0, 0.0)
                 times.append(time.perf_counter() - t0)
             solve = float(np.median(times))
-            log(f'{self.n_samples} samples: solve {1e3 * solve:.1f} ms on {jax.devices()[0].platform}')
+            log(f'{self.n_samples} samples, {self.iterations} iteration(s): solve {1e3 * solve:.1f} ms '
+                f'on {jax.devices()[0].platform}')
+            return solve
+
+        if not search:   # sample count and iterations set by the caller
+            timed()
+            self.u_nom[:] = 0.0
+            self.ref_idx = None
+            return
+        last = None
+        while True:
+            solve = timed()
+            if last is not None and solve > HALVING_GAIN * last:
+                self.n_samples *= 2   # halving saved too little: keep the larger count
+                solve = last
+                log(f'fewer samples barely help on this machine; using {self.n_samples}')
+                break
             if solve <= SOLVE_BUDGET or self.n_samples <= MIN_SAMPLES:
                 break
+            last = solve
             self.n_samples //= 2
+        if solve > SOLVE_BUDGET and self.iterations > 1:
+            # One MPPI round per tick: the warm start from the last tick stands in for the
+            # second, and drives the same in the car tests while saving a third of the solve.
+            self.iterations = 1
+            timed()
         self.u_nom[:] = 0.0
         self.ref_idx = None
 
@@ -175,21 +223,25 @@ class Controller:
             return pose, speed, self.steer_est, yaw_rate
         cmds = np.zeros((mp.PREDICT_MAX, 2), np.float32)
         cmds[:n] = self._wheel_cmds(now + self.latency - latency, n)
-        dx, dy, dyaw, steer, v, r = (float(o) for o in mp.propagate(
-            np.float32(max(speed, 0.0)), np.float32(self.steer_est), np.float32(yaw_rate), cmds, n, np.float32(self.mu), self.car))
+        with jax.default_device(self.cpu):
+            dx, dy, dyaw, steer, v, r = (float(o) for o in mp.propagate(
+                np.float32(max(speed, 0.0)), np.float32(self.steer_est), np.float32(yaw_rate), cmds, n, np.float32(self.mu), self.car))
         x, y, yaw = pose
         c, s = math.cos(yaw), math.sin(yaw)
         return (x + c * dx - s * dy, y + s * dx + c * dy, yaw + dyaw), v, steer, r
 
     def _update_speed_scale(self, pose, speed, dt):
         xy = np.array(pose[:2])
-        if self._scale_acc is None or speed < SCALE_MIN_SPEED:
+        if self._scale_acc is None:
             self._scale_acc = (xy, 0.0, 0.0)
             return
         last, d_pf, d_odom = self._scale_acc
         step = float(np.linalg.norm(xy - last))
-        if step > 2.0 * speed * dt + 0.1:          # the pose filter jumped; start over
+        if step > 2.0 * speed * dt + SCALE_JUMP:   # the pose filter jumped; start over
             self._scale_acc = (xy, 0.0, 0.0)
+            return
+        if speed < SCALE_MIN_SPEED:                # slow: pause the window, keep what it has
+            self._scale_acc = (xy, d_pf, d_odom)
             return
         d_pf, d_odom = d_pf + step, d_odom + speed * dt
         if d_odom >= SCALE_WINDOW:
@@ -198,12 +250,33 @@ class Controller:
             d_pf = d_odom = 0.0
         self._scale_acc = (xy, d_pf, d_odom)
 
+    def _filter_speed(self, speed, now):
+        """Odometry speed with dropouts replaced by the speed loop's prediction."""
+        if self.v_est is None or self.last_time is None:
+            self.v_est = speed
+            return speed
+        dt = min(max(now - self.last_time, 0.0), 0.1)
+        if speed >= self.v_est - ODOM_BRAKE * dt - ODOM_NOISE:
+            self.v_est, self.dropout_since = speed, None
+            return speed
+        if self.dropout_since is None:
+            self.dropout_since = now
+            self.dropouts += 1
+        if now - self.dropout_since > ODOM_HOLD:     # a real stop (a crash): believe it
+            self.v_est, self.dropout_since = speed, None
+            return speed
+        cmd = self._cmd_at(now - self.latency)[1] / self.speed_scale
+        kp = self.model.kp_up if cmd > self.v_est else self.model.kp_down
+        self.v_est += kp * (cmd - self.v_est) * dt
+        return self.v_est
+
     def step(self, pose, speed, now, age=0.0, yaw_rate=None):
         """pose (x, y, yaw) in the map frame, speed m/s (odometry), now in seconds,
         age: how long before `now` the pose was measured plus the expected solve
         time. yaw_rate: measured (rad/s); None assumes the steady state for the
         steering angle. Returns the (steer, speed) command."""
         if self.calibrate_speed:
+            speed = self._filter_speed(speed, now)
             if self.last_time is not None:
                 self._update_speed_scale(pose, speed, now - self.last_time)
             speed *= self.speed_scale               # true speed from here on
@@ -230,7 +303,7 @@ class Controller:
             self.reverse_until = None
             self.u_nom[:] = 0.0
         u, traj, cost, samples = self._solve(x, y, yaw, max(speed, 0.0), steer_wheel, yaw_rate)
-        self.u_nom = u
+        self.u_nom = np.array(u)   # writable copy (the solver returns read-only arrays)
         self.plan, self.plan_cost = traj, float(cost)
         self.plan_pose, self.samples = pose, samples
 
@@ -246,7 +319,19 @@ class Controller:
                 return self._send(now, self.reverse_steer, REVERSE_SPEED)
         else:
             self.stuck_since = None
-        return self._send(now, float(u[0, 0]), float(u[0, 1]))
+        return self._send(now, float(u[0, 0]), self._limit_speed(now, float(u[0, 1])))
+
+    def _limit_speed(self, now, speed):
+        """The speed sent may rise at most cmd_accel and fall at most cmd_decel per
+        second from the last one sent: the planner may swap between a go and a brake
+        plan from one tick to the next, which made the car stutter."""
+        if not self.sent or self.sent[-1][2] < 0.0:
+            return speed
+        t_prev, _, v_prev = self.sent[-1]
+        dt = min(max(now - t_prev, 0.0), 0.1)
+        speed = min(max(speed, v_prev - self.model.cmd_decel * dt), v_prev + self.model.cmd_accel * dt)
+        self.u_nom[0, 1] = speed   # the warm start begins from what was sent
+        return speed
 
     def rear_clearance(self, x, y, yaw):
         """Clearance of the rear of the body to scan returns, swept 0.3 m back."""

@@ -1,6 +1,6 @@
 # Reference line per gym map, for config:=sim. The launch file reads the map
 # the gym is set to (map_path in f1tenth_gym_ros/config/sim.yaml) and uses the
 # entry whose name is the longest prefix of the map's name, so aims and
-# aims_obs share aims_closed.csv. Add a line here for a new map.
-aims: /sim_ws/src/pure_pursuit/waypoints/aims_closed.csv
+# aims_obs share ri.csv. Add a line here for a new map.
+aims: /home/f1tenth/f1tenth_ws/src/waypoints/ri.csv
 levine: /sim_ws/src/lap_timer/waypoints/levine.csv

@@ -3,4 +3,4 @@ scan_mppi:
     sim: true
     max_speed: 9.5
     friction: 1.0489      # f1tenth_gym default
-    waypoints_file: /sim_ws/src/pure_pursuit/waypoints/aims_closed.csv
+    waypoints_file: /sim_ws/src/pure_pursuit/waypoints/ri.csv

@@ -1,6 +1,13 @@
 scan_mppi:
   ros__parameters:
     sim: false
-    max_speed: 4.0
-    friction: 0.6         # start low; raise once the car holds the line
-    waypoints_file: /home/f1tenth_ws/src/pure_pursuit/waypoints/aims_closed.csv
+    # From the 2026-10-25/27 bags: the yaw response starts falling off at ~3 m/s^2 of
+    # lateral acceleration and the car slides above ~4; 0.4 holds corners at ~3.5.
+    friction: 0.4
+    max_speed: 4.15
+    waypoints_file: ri.csv   # a bare name: <ws>/src/waypoints/ first, then scan_mppi/waypoints/
+    # Fixed here so startup compiles one solver (then cached in ~/.cache/scan_mppi);
+    # 0 = pick at startup to fit the solve budget (compiles each count it tries)
+    samples: 2048
+    iterations: 1
+    viz: false                         # false: no /mppi markers (saves the Orin's CPU)

@@ -11,9 +11,11 @@
 #   bash setup_jetson.sh --wheels DIR   install GPU wheels built earlier (jaxlib,
 #                                   jax_cuda12_plugin, jax_cuda12_pjrt)
 #   bash setup_jetson.sh --cpu      CPU JAX only
-#   --ws DIR                        workspace to build scan_mppi in (default /home/f1tenth_ws)
-#   --jobs N                        parallel compile jobs for --build (default 4; more can
-#                                   run the Orin out of memory and freeze it)
+#   --ws DIR                        workspace to build scan_mppi in (default: the one this
+#                                   script is in, <ws>/src/scan_mppi/scripts)
+#   --jobs N                        parallel compile jobs for --build (default: one per 3 GB
+#                                   of RAM, 2 on an 8 GB Orin Nano; more can run it out of
+#                                   memory and freeze it)
 #
 # Why a source build: JAX publishes no Jetson wheels, and its generic aarch64 CUDA
 # wheels install on an Orin but fail at the first kernel ("no kernel image is
@@ -27,12 +29,13 @@ JAX_VER=0.5.3        # first release known to build and run on Orin; same as the
 NUMPY_VER=1.26.4     # ROS 2 Humble's cv_bridge etc. break on numpy 2, which JAX would pull in
 SCIPY_VER=1.11.4
 ML_DTYPES_VER=0.5.1
+TRANSFORMS3D_VER=0.4.2  # first release without np.float, which numpy >= 1.24 lacks
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 WHEELS_DIR=$HOME/jax_wheels/$JAX_VER
 ENV_FILE=$HOME/.scan_mppi_env
-WS=/home/f1tenth_ws
+WS=$(cd "$(dirname "$0")/../../.." && pwd)
 MODE=auto
-JOBS=4
+JOBS=$(awk '/MemTotal/ {j = int($2 / 3145728); print (j < 1 ? 1 : j)}' /proc/meminfo)
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -42,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --wheels) MODE=wheels; WHEELS_DIR=$(realpath "$2"); shift ;;
         --ws) WS=$2; shift ;;
         --jobs) JOBS=$2; shift ;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
         *) echo "unknown option $1 (see --help)" >&2; exit 1 ;;
     esac
     shift
@@ -92,8 +95,7 @@ if [[ $MODE == check ]]; then
     python3 -m pip --version >/dev/null 2>&1 && ok "pip" || bad "pip missing: sudo apt install python3-pip"
     [[ -f /opt/ros/humble/setup.bash ]] && ok "ROS 2 Humble" || bad "/opt/ros/humble not found"
     [[ -d $WS/src ]] && ok "workspace $WS" || note "workspace $WS not found (--ws DIR)"
-    [[ -f $WS/src/pure_pursuit/waypoints/aims_closed.csv ]] && ok "aims_closed.csv" \
-        || note "$WS/src/pure_pursuit/waypoints/aims_closed.csv missing (copy it, or set waypoints_file in car.yaml)"
+    [[ -e $WS/src/scan_mppi ]] && ok "scan_mppi in $WS/src" || note "scan_mppi is not in $WS/src"
 
     say "CUDA (JetPack), needed by GPU JAX at run time"
     version_ge 12.6 "$CUDA_VER" && ok "CUDA $CUDA_VER" || bad "CUDA '${CUDA_VER:-none}': need >= 12.6 (JetPack 6.1+)"
@@ -104,9 +106,12 @@ if [[ $MODE == check ]]; then
     done
     find_lib libcupti.so.12 && ok "libcupti.so.12" || note "libcupti.so.12 not found (profiling only)"
     # XLA compiles its kernels with ptxas at run time; without it JAX fails on the first jit
-    if "$CUDA_HOME/bin/ptxas" --help 2>/dev/null | grep -q sm_87 || "$CUDA_HOME/bin/ptxas" --list-gpu-arch 2>/dev/null | grep -q sm_87; then
-        ok "ptxas (sm_87)"
-    else bad "$CUDA_HOME/bin/ptxas missing or without sm_87 (sudo apt install cuda-nvcc-12-6)"; fi
+    tmp=$(mktemp -d)
+    printf '.version 7.4\n.target sm_87\n.address_size 64\n.visible .entry k() { ret; }\n' > "$tmp/k.ptx"
+    if out=$("$CUDA_HOME/bin/ptxas" -arch=sm_87 -o "$tmp/k.cubin" "$tmp/k.ptx" 2>&1); then
+        ok "ptxas $("$CUDA_HOME/bin/ptxas" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p') assembles sm_87"
+    else bad "$CUDA_HOME/bin/ptxas cannot assemble sm_87: ${out:-not found} (sudo apt install cuda-nvcc-12-6)"; fi
+    rm -rf "$tmp"
     if [[ -x $CUDA_HOME/bin/nvcc ]]; then
         tmp=$(mktemp -d)
         cat > "$tmp/k.cu" <<'CU'
@@ -151,7 +156,10 @@ PY
     for url in https://github.com https://apt.llvm.org https://pypi.org https://storage.googleapis.com; do
         curl -sI --max-time 8 "$url" >/dev/null 2>&1 && ok "reach $url" || bad "cannot reach $url (the build downloads from it)"
     done
-    command -v nvpmodel >/dev/null && note "power mode: $(nvpmodel -q 2>/dev/null | head -n1) (build and run fastest with: sudo nvpmodel -m 0 && sudo jetson_clocks)"
+    if command -v nvpmodel >/dev/null; then
+        note "$(nvpmodel -q 2>/dev/null | head -n1); modes on this board: $(sed -n 's/^< POWER_MODEL ID=\([0-9]*\) NAME=\([^ >]*\).*/\1=\2/p' /etc/nvpmodel.conf 2>/dev/null | tr '\n' ' ')"
+        note "build and run fastest in the highest mode: sudo nvpmodel -m <id> && sudo jetson_clocks"
+    fi
 
     echo
     if [[ $fails == 0 ]]; then echo "All checks passed: ready for  bash $0 --build"
@@ -183,6 +191,9 @@ fi
 say "2/6  Python packages"
 python3 -m pip --version >/dev/null 2>&1 || die "pip missing: sudo apt install python3-pip"
 pip_install "numpy==$NUMPY_VER" "scipy==$SCIPY_VER" "ml_dtypes==$ML_DTYPES_VER" pyyaml
+# This numpy shadows Ubuntu's 1.21, and Ubuntu's transforms3d 0.3 (under
+# tf_transformations, range_libc, the particle filter) uses np.float, gone since 1.24
+pip_install "transforms3d==$TRANSFORMS3D_VER"
 
 # ------------------------------------------------------------- environment
 say "3/6  Environment ($ENV_FILE)"
@@ -198,15 +209,20 @@ source "$ENV_FILE"
 
 # ------------------------------------------------------------------- JAX
 
-have_wheels() { ls "$1"/jaxlib-"$JAX_VER"-*.whl "$1"/jax_cuda12_plugin-"$JAX_VER"-*.whl "$1"/jax_cuda12_pjrt-"$JAX_VER"-*.whl >/dev/null 2>&1; }
+# A source build names its wheels <ver>.dev<date> unless built as a release
+wheel() { compgen -G "$1/$2-$JAX_VER-*.whl" || compgen -G "$1/$2-$JAX_VER.dev*.whl"; }
+have_wheels() { wheel "$1" jaxlib >/dev/null && wheel "$1" jax_cuda12_plugin >/dev/null && wheel "$1" jax_cuda12_pjrt >/dev/null; }
 
 install_gpu_wheels() {
     have_wheels "$1" || die "no jaxlib / jax_cuda12_plugin / jax_cuda12_pjrt $JAX_VER wheels in $1"
     # The plugin without its [with-cuda] extra: NVIDIA's pip CUDA libraries are for
     # servers and crash on the Orin; JetPack's own (LD_LIBRARY_PATH above) are used.
-    pip_install --force-reinstall --no-deps "$1"/jaxlib-"$JAX_VER"-*.whl \
-        "$1"/jax_cuda12_plugin-"$JAX_VER"-*.whl "$1"/jax_cuda12_pjrt-"$JAX_VER"-*.whl
-    pip_install "jax==$JAX_VER" "numpy==$NUMPY_VER" "scipy==$SCIPY_VER" "ml_dtypes==$ML_DTYPES_VER" opt_einsum
+    pip_install --force-reinstall --no-deps "$(wheel "$1" jaxlib | tail -n1)" \
+        "$(wheel "$1" jax_cuda12_plugin | tail -n1)" "$(wheel "$1" jax_cuda12_pjrt | tail -n1)"
+    # jax's own dependencies by hand and jax with --no-deps: pip ranks 0.5.3.dev<date>
+    # below 0.5.3, so resolving jax's "jaxlib>=0.5.3" would swap in pypi's CPU jaxlib
+    pip_install "numpy==$NUMPY_VER" "scipy==$SCIPY_VER" "ml_dtypes==$ML_DTYPES_VER" opt_einsum
+    pip_install --no-deps "jax==$JAX_VER"
 }
 
 build_gpu_wheels() {
@@ -262,13 +278,13 @@ else
     [[ $MODE == cpu ]] || die "JAX does not run on the GPU (see the output above)"
 fi
 PKG=$(cd "$(dirname "$0")/.." && pwd)
-if [[ -f $WS/src/pure_pursuit/waypoints/aims_closed.csv ]]; then
+if [[ -f $PKG/waypoints/aims_closed.csv ]]; then
     echo "scan_mppi solve time on this machine:"
     PYTHONPATH=$PKG python3 -c "
 from scan_mppi.controller import Controller
-Controller('$WS/src/pure_pursuit/waypoints/aims_closed.csv', False, 4.0, 0.6).warm_up()"
+Controller('$PKG/waypoints/aims_closed.csv', False, 4.0, 0.6).warm_up()"
 else
-    warn "$WS/src/pure_pursuit/waypoints/aims_closed.csv not found; skipping the solve-time check"
+    warn "$PKG/waypoints/aims_closed.csv not found; skipping the solve-time check"
 fi
 
 # ------------------------------------------------------------------ build
@@ -287,5 +303,5 @@ fi
 echo
 echo "Done: JAX on the $ON."
 [[ $ON == gpu ]] || echo "For the GPU (once, takes hours): bash $0 --build    then copy $WHEELS_DIR to other cars and use --wheels."
-echo "For the fastest solves: sudo nvpmodel -m 0 && sudo jetson_clocks"
+echo "For the fastest solves: sudo nvpmodel -m <highest mode, see --check> && sudo jetson_clocks"
 echo "Run: source $WS/install/setup.bash && ros2 launch scan_mppi scan_mppi.launch.py config:=car"

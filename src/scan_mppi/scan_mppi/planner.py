@@ -36,7 +36,7 @@ from . import vehicle as veh
 DT = 0.05            # rollout step (s)
 STEPS = 30           # 1.5 s: covers braking from 9.5 m/s at A_MAX with room to spare
 SAMPLES = 2048       # default; the controller drops to fewer if a solve is too slow (Jetson)
-ITERATIONS = 2
+ITERATIONS = 2       # default; the controller uses 1 if a solve is too slow (Jetson)
 NOISE_LAT_ACCEL = 1.5  # m/s^2: steering noise is sized as lateral acceleration, so it shrinks as 1/v^2.
                        # A fixed angle that explores corners at 2 m/s puts every 6 m/s sample into a wall.
 NOISE_STEER_MAX = 0.3   # rad, the cap at low speed: getting round something close needs near full lock
@@ -63,17 +63,22 @@ SEARCH = 12          # points a rollout's projection may advance per step (1.2 m
 
 # Cost weights, in units where 1 = one metre of progress lost.
 TEMPERATURE = 0.3    # m: samples more than ~1 m of progress behind the best barely count
+MODE_SIGMA = 0.2     # m: samples are also weighted by how near their path stays to the best
+                     # sample's (RMS distance). Averaging a go-left and a go-right plan gives
+                     # one aimed at the obstacle between them, which then brakes.
 W_DEV = 1.0          # per m^2 per s
 W_OVERSPEED = 20.0   # per (m/s)^2 per s
 W_GRIP = 20.0        # per (m/s^2)^2 per s above the friction circle: grip is a limit, not a trade
 W_SLIP = 200.0       # per rad^2 per s of body slip beyond SLIP_MAX
 SLIP_MAX = 0.1       # rad. The gym's tyres are linear and never saturate, so without this the
                      # optimiser finds brake-induced oversteer "drifts" that no real car survives.
-W_CLEAR = 400.0      # per m^2 per s inside CLEAR_MARGIN
-CLEAR_MARGIN = 0.25  # body clearance (m) below which the soft cost starts
+W_CLEAR = 400.0      # per m^2 per s inside the clearance margin
+CLEAR_MARGIN = 0.10  # body clearance (m) below which the soft cost starts, plus
+CLEAR_MARGIN_PER_V = 0.07  # m per m/s (0.31 m at 3 m/s). A fixed 0.25 m made a 0.6 m gap
+                           # cost more than stopping, so the car crept or stopped before it.
 W_COLLIDE = 50.0     # per step after first contact
 HIT_MARGIN = 0.04    # m of body clearance that already counts as contact, plus
-HIT_MARGIN_PER_V = 0.012  # m per m/s: pose, scan-grid and prediction error grow with speed
+HIT_MARGIN_PER_V = 0.025  # m per m/s: pose, scan-grid and prediction error grow with speed
 VIZ_SAMPLES = 64     # rollouts returned for display
 W_STEER_JERK = 2.0   # per rad^2 between consecutive steering commands
 
@@ -180,7 +185,7 @@ def rollout_costs(U, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, g
             + W_OVERSPEED * jnp.maximum(v - ref_v[idx], 0.0) ** 2
             + W_GRIP * jnp.maximum(a_total - a_lat, 0.0) ** 2
             + W_SLIP * jnp.maximum(jnp.abs(slip) - SLIP_MAX, 0.0) ** 2
-            + W_CLEAR * jnp.maximum(CLEAR_MARGIN - clear, 0.0) ** 2
+            + W_CLEAR * jnp.maximum(CLEAR_MARGIN + CLEAR_MARGIN_PER_V * v - clear, 0.0) ** 2
         ) + W_COLLIDE * hit
         return (s, steer_cmd, idx, hit, cost), jnp.stack([x, y, v], -1)
 
@@ -295,10 +300,28 @@ def tracking_seeds(v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, gri
                     v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, mu, car, max_speed)
 
 
-@partial(jax.jit, static_argnames=('max_speed', 'samples'))
-def solve(key, u_nom, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, grid, mu, car, max_speed, samples=SAMPLES):
-    """One control tick: ITERATIONS rounds of MPPI around u_nom (T, 2), `samples` rollouts each.
-    car: vehicle.Model.array() (steering limit and rate, speed-loop gains)."""
+def rate_limit(U, steer_prev, car):
+    """Limit how fast the steering commands in the candidates (K, T, 2) may change,
+    from the command sent last tick, to the servo's own rate: no candidate can flip
+    full left to full right between ticks (the car see-sawed around obstacles).
+    Candidates are limited before they are scored, so the plans stay what the car is
+    told. (The speed command is limited on output, in the controller: the first
+    command of a plan barely changes its cost, so limited here it never rose.)"""
+    d_steer = car[5] * DT
+
+    def f(prev, s):
+        out = jnp.clip(s, prev - d_steer, prev + d_steer)
+        return out, out
+
+    _, steer = jax.lax.scan(f, jnp.full(U.shape[0], steer_prev), U[:, :, 0].T)
+    return U.at[:, :, 0].set(steer.T)
+
+
+@partial(jax.jit, static_argnames=('max_speed', 'samples', 'iterations'))
+def solve(key, u_nom, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, grid, mu, car, max_speed,
+          samples=SAMPLES, iterations=ITERATIONS):
+    """One control tick: `iterations` rounds of MPPI around u_nom (T, 2), `samples` rollouts each.
+    car: vehicle.Model.array() (steering limit and rate, speed-loop gains, command rate limits)."""
     v_plan = jnp.maximum(jnp.maximum(u_nom[:, 1], v0), 1.0)
     sigma_steer = jnp.minimum(NOISE_LAT_ACCEL * veh.WHEELBASE / v_plan ** 2, NOISE_STEER_MAX)
     sigma = jnp.stack([sigma_steer, jnp.full(STEPS, NOISE_SPEED)], -1)  # (T, 2)
@@ -323,16 +346,20 @@ def solve(key, u_nom, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, 
         _, out = jax.lax.scan(f, e[:, 0], jnp.swapaxes(e, 0, 1))
         return jnp.swapaxes(out, 0, 1)
 
-    for _ in range(ITERATIONS):
+    for _ in range(iterations):
         key, sub = jax.random.split(key)
         noise = smooth(jax.random.normal(sub, (samples, STEPS, 2))) * sigma
         U = jnp.clip(u_nom[None] + noise, lo, hi)
         U = U.at[0].set(u_nom)                                   # keep the warm start
         U = U.at[1].set(u_nom.at[:, 1].set(0.0))                 # and a hard stop on the same steering
         U = jnp.concatenate([U, seeds])                          # seeds on top of the random samples
+        U = rate_limit(U, steer_prev, car)
         costs, trajs = rollout_costs(U, v0, steer0, yaw_rate0, steer_prev, ref_xy, ref_v, ref_ds, grid, mu, car)
         best = jnp.min(costs)
         w = jnp.exp(-(costs - best) / TEMPERATURE)
+        if MODE_SIGMA > 0:
+            d2 = jnp.mean(jnp.sum((trajs[:, :, :2] - trajs[jnp.argmin(costs), :, :2]) ** 2, -1), -1)
+            w = w * jnp.exp(-0.5 * d2 / MODE_SIGMA ** 2)
         w = w / jnp.sum(w)
         u_nom = jnp.einsum('k,ktc->tc', w, U)
     # Score the averaged plan itself for the visualisation and the stats.
